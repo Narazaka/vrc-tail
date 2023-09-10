@@ -3,9 +3,26 @@ const fs = require("fs");
 const path = require("path");
 const readline = require("node:readline");
 const colors = require("colors/safe");
+const { program } = require("commander");
 const { Tail } = require("tail");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
+
+program
+  .option("-f, --filter <str>", "filter")
+  .parse();
+
+/**
+ * @type {{filter?: (line: string) => boolean}}
+ */
+const options = {
+  filter: program.opts().filter,
+};
+
+const programOptions = program.opts();
+if (programOptions.filter) {
+  options.filter = (line) => line.includes(programOptions.filter);
+}
 
 /**
  *
@@ -78,13 +95,6 @@ for (const entry of entries) {
 
 targetEntries.reverse();
 
-/**
- * @type {{filter?: (line: string) => boolean}}
- */
-const options = {
-  filter: undefined,
-};
-
 const colorNames = [
   // "red",
   "green",
@@ -138,8 +148,8 @@ rl.on("line", (line) => {
       break;
     default:
       if (line.startsWith("/")) {
-        const re = new RegExp(line.slice(1).trim());
-        options.filter = (line) => re.test(line);
+        const filter = line.slice(1).trim();
+        options.filter = (line) => line.includes(filter);
       }
       break;
   }
