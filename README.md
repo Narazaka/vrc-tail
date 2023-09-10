@@ -12,6 +12,10 @@ tail -f for VRChat logs
 
 ![console](console.png)
 
+## Install
+
+Download from [Release page](https://github.com/Narazaka/vrc-tail/releases/latest) and place somewhere.
+
 ## Console Commands
 
     ? - show this help
