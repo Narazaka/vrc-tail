@@ -2,7 +2,7 @@
 
 tail -f for VRChat logs
 
-- reads recent set of logs (starts in 30 seconds)
+- reads recent set of logs (started in 30 seconds)
   - output_log_2023-09-10_12-12-00.txt: read as `[3]`
   - output_log_2023-09-10_12-11-40.txt: read as `[2]`
   - output_log_2023-09-10_12-11-10.txt: read as `[1]`
