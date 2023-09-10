@@ -12,6 +12,13 @@ tail -f for VRChat logs
 
 ![console](console.png)
 
+## Console Commands
+
+    ? - show this help
+    q - quit
+    / <str> - filter
+    r - reset filter
+
 ## License
 
 [Zlib License](LICENSE)
