@@ -1,0 +1,25 @@
+{
+  "name": "vrc-tail",
+  "version": "1.0.0",
+  "description": "tail -f for VRChat logs",
+  "bin": {
+    "vrc-tail": "./bin/vrc-tail.js"
+  },
+  "scripts": {
+    "build": "pkg . -t node18-win-x64",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "colors": "^1.4.0",
+    "tail": "^2.2.6"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1",
+    "prettier": "^3.0.3"
+  },
+  "author": {
+    "name": "narazaka",
+    "url": "https://github.com/Narazaka"
+  },
+  "license": "Zlib"
+}
