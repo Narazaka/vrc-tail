@@ -8,9 +8,7 @@ const { Tail } = require("tail");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 
-program
-  .option("-f, --filter <str>", "filter")
-  .parse();
+program.option("-f, --filter <str>", "filter").parse();
 
 /**
  * @type {{filter?: (line: string) => boolean}}
