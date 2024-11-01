@@ -23,6 +23,8 @@ Download from [Release page](https://github.com/Narazaka/vrc-tail/releases/lates
 >   ? - show this help
 >   q - quit
 >   s - toggle ignore blank lines
+>   l - toggle colored log level
+>   d - toggle supress log date
 >   /<str> - filter
 >   r - reset filter
 ```
