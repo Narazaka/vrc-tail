@@ -1,7 +1,6 @@
 // @ts-check
 const fs = require("fs");
 const path = require("path");
-const readline = require("node:readline");
 const colors = require("colors/safe");
 const { program } = require("commander");
 const { Tail } = require("tail");
@@ -125,17 +124,39 @@ for (let i = 0; i < targetEntries.length; i++) {
   tail(entry.path, i);
 }
 
-const rl = readline.createInterface({
-  input: process.stdin,
-});
+const stdin = process.stdin;
+stdin.setRawMode(true);
+stdin.resume();
+stdin.setEncoding("utf8");
+let isFilterInput = false;
+let filterInput = "";
+stdin.on("data", (data) => {
+  const key = /** @type {string} */ (/** @type {unknown} */ (data));
+  // ctrl-c ( end of text )
+  if (key === "\u0003") {
+    process.exit();
+  }
 
-rl.on("line", (line) => {
-  switch (line) {
+  if (isFilterInput) {
+    if (key === "\r" || key === "\n") {
+      const filter = filterInput;
+      options.filter = (line) => line.includes(filter);
+      isFilterInput = false;
+      filterInput = "";
+      process.stdout.write("\n");
+      process.stdout.write(`filter = ${filter}\n`);
+      return;
+    }
+    filterInput += key;
+    process.stdout.write(key);
+    return;
+  }
+  switch (key) {
     case "?":
       console.log("Commands:");
       console.log("  ? - show this help");
       console.log("  q - quit");
-      console.log("  / <str> - filter");
+      console.log("  /<str> - filter");
       console.log("  r - reset filter");
       break;
     case "q":
@@ -143,12 +164,12 @@ rl.on("line", (line) => {
       break;
     case "r":
       options.filter = undefined;
+      process.stdout.write("filter cleared!\n");
       break;
-    default:
-      if (line.startsWith("/")) {
-        const filter = line.slice(1).trim();
-        options.filter = (line) => line.includes(filter);
-      }
+    case "/":
+      isFilterInput = true;
+      filterInput = "";
+      process.stdout.write(key);
       break;
   }
 });

@@ -20,7 +20,7 @@ Download from [Release page](https://github.com/Narazaka/vrc-tail/releases/lates
 
     ? - show this help
     q - quit
-    / <str> - filter
+    /<str> - filter
     r - reset filter
 
 ## License
