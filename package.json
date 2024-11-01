@@ -6,7 +6,7 @@
     "vrc-tail": "./bin/vrc-tail.js"
   },
   "scripts": {
-    "build": "pkg . -t node18-win-x64",
+    "build": "pkg . -t node22-win-x64",
     "format": "prettier --write ."
   },
   "dependencies": {
@@ -15,7 +15,7 @@
     "tail": "^2.2.6"
   },
   "devDependencies": {
-    "pkg": "^5.8.1",
+    "@yao-pkg/pkg": "^6.0.0",
     "prettier": "^3.3.3"
   },
   "author": {
