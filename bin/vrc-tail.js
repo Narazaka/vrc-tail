@@ -10,14 +10,15 @@ const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 
 program
   .option("-f, --filter <str>", "filter")
-  .option("-s, --ignore-blank-lines", "ignoreBlankLines")
-  .option("-l, --no-colored-log-level", "noColoredLogLevel")
-  .option("-d, --suppress-log-date", "suppressLogDate")
+  .option("-s, --ignore-blank-lines", "ignore blank lines")
+  .option("-L, --no-colored-log-level", "no colored log level")
+  .option("-d, --suppress-log-date", "suppress log date")
+  .option("-g, --group-period <sec>", "log group pediod (seconds)")
   .option("--no-watch", "noWatch")
   .parse();
 
 /**
- * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean; watch: boolean}}
+ * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean; watch: boolean; groupPediod: number}}
  */
 const options = {
   filter: program.opts().filter,
@@ -25,6 +26,7 @@ const options = {
   coloredLogLevel: true,
   suppressLogDate: false,
   watch: true,
+  groupPediod: 30,
 };
 
 const programOptions = program.opts();
@@ -42,6 +44,9 @@ if (programOptions.suppressLogDate) {
 }
 if (programOptions.noWatch) {
   options.watch = false;
+}
+if (programOptions.groupPediod) {
+  options.groupPediod = Number(programOptions.groupPediod);
 }
 
 function formatedTimestamp() {
@@ -119,7 +124,7 @@ function setTails() {
       targetEntries.push(entry);
       continue;
     }
-    if (entry.time - previousEntry.time > 1000 * 30) {
+    if (entry.time - previousEntry.time > 1000 * options.groupPediod) {
       targetEntries.length = 0;
       if (tails.length > 0) {
         for (const tail of tails) {
