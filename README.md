@@ -18,10 +18,14 @@ Download from [Release page](https://github.com/Narazaka/vrc-tail/releases/lates
 
 ## Console Commands
 
-    ? - show this help
-    q - quit
-    /<str> - filter
-    r - reset filter
+```
+> Commands:
+>   ? - show this help
+>   q - quit
+>   n - toggle ignore blank lines
+>   /<str> - filter
+>   r - reset filter
+```
 
 ## License
 

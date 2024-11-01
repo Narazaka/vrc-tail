@@ -103,6 +103,8 @@ const colorNames = [
   "gray",
 ];
 
+let ignoreBlankLines = false;
+
 /**
  *
  * @param {string} path
@@ -111,6 +113,7 @@ const colorNames = [
 function tail(path, index) {
   new Tail(path, { follow: true }).on("line", (line) => {
     if (options.filter && !options.filter(line)) return;
+    if (ignoreBlankLines && line.length === 0) return;
     console.log(
       colors[colorNames[index % colorNames.length]](
         `${formatTimestamp(new Date())} [${index}] ${line}`,
@@ -144,7 +147,7 @@ stdin.on("data", (data) => {
       isFilterInput = false;
       filterInput = "";
       process.stdout.write("\n");
-      process.stdout.write(`filter = ${filter}\n`);
+      process.stdout.write(`> filter = ${filter}\n`);
       return;
     }
     filterInput += key;
@@ -153,18 +156,23 @@ stdin.on("data", (data) => {
   }
   switch (key) {
     case "?":
-      console.log("Commands:");
-      console.log("  ? - show this help");
-      console.log("  q - quit");
-      console.log("  /<str> - filter");
-      console.log("  r - reset filter");
+      console.log("> Commands:");
+      console.log(">   ? - show this help");
+      console.log(">   q - quit");
+      console.log(">   n - toggle ignore blank lines");
+      console.log(">   /<str> - filter");
+      console.log(">   r - reset filter");
       break;
     case "q":
       process.exit(0);
       break;
+    case "n":
+      ignoreBlankLines = !ignoreBlankLines;
+      process.stdout.write(`> ignoreBlankLines = ${ignoreBlankLines}\n`);
+      break;
     case "r":
       options.filter = undefined;
-      process.stdout.write("filter cleared!\n");
+      process.stdout.write("> filter cleared!\n");
       break;
     case "/":
       isFilterInput = true;
