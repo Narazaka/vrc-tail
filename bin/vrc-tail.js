@@ -4,6 +4,7 @@ const path = require("path");
 const colors = require("colors/safe");
 const { program } = require("commander");
 const { Tail } = require("tail");
+const { watch } = require("chokidar");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 
@@ -12,16 +13,18 @@ program
   .option("-s, --ignore-blank-lines", "ignoreBlankLines")
   .option("-l, --no-colored-log-level", "noColoredLogLevel")
   .option("-d, --suppress-log-date", "suppressLogDate")
+  .option("--no-watch", "noWatch")
   .parse();
 
 /**
- * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean}}
+ * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean; watch: boolean}}
  */
 const options = {
   filter: program.opts().filter,
   ignoreBlankLines: false,
   coloredLogLevel: true,
   suppressLogDate: false,
+  watch: true,
 };
 
 const programOptions = program.opts();
@@ -36,6 +39,9 @@ if (programOptions.noColoredLogLevel) {
 }
 if (programOptions.suppressLogDate) {
   options.suppressLogDate = true;
+}
+if (programOptions.noWatch) {
+  options.watch = false;
 }
 
 function formatedTimestamp() {
@@ -82,36 +88,79 @@ function dateOf(str) {
   );
 }
 
-const entries = fs
-  .readdirSync(dir)
-  .filter((f) => targetRe.test(f))
-  .map((f) => ({
-    name: f,
-    path: path.join(dir, f),
-    time: dateOf(f)?.getTime() ?? 0,
-  }))
-  .sort((a, b) => b.time - a.time);
-if (entries.length === 0) {
-  console.error("No log files found");
-  process.exit(1);
-}
-
+const entries = [];
 const targetEntries = [];
+/** @type {Tail[]} */
+const tails = [];
 
-for (const entry of entries) {
-  const previousEntry = targetEntries[targetEntries.length - 1];
-  if (!previousEntry) {
-    targetEntries.push(entry);
-    continue;
+/**
+ * @param {string} filepath
+ */
+function addLogFile(filepath) {
+  const filename = path.basename(filepath);
+  if (!targetRe.test(filename)) return;
+  const entry = {
+    path: filepath,
+    time: dateOf(filename)?.getTime() ?? 0,
+  };
+  const index = entries.findIndex((e) => e.time > entry.time);
+  if (index === -1) {
+    entries.push(entry);
+  } else {
+    entries.splice(index, 0, entry);
   }
-  if (previousEntry.time - entry.time > 1000 * 30) {
-    // 30 seconds
-    break;
-  }
-  targetEntries.push(entry);
 }
 
-targetEntries.reverse();
+function setTails() {
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const previousEntry = targetEntries[targetEntries.length - 1];
+    if (!previousEntry) {
+      targetEntries.push(entry);
+      continue;
+    }
+    if (entry.time - previousEntry.time > 1000 * 30) {
+      targetEntries.length = 0;
+      if (tails.length > 0) {
+        for (const tail of tails) {
+          tail.unwatch();
+        }
+        tails.length = 0;
+        console.log("-".repeat(79));
+      }
+    }
+    targetEntries.push(entry);
+  }
+
+  for (let i = tails.length; i < targetEntries.length; i++) {
+    const entry = targetEntries[i];
+    tails.push(tail(entry.path, i));
+  }
+}
+
+/**
+ * @param {string} filepath
+ */
+function addLogFileAndSetTails(filepath) {
+  addLogFile(filepath);
+  setTails();
+}
+
+for (const filename of fs.readdirSync(dir)) {
+  addLogFile(path.join(dir, filename));
+}
+setTails();
+if (options.watch) {
+  watch(dir, { depth: 0, ignoreInitial: true }).on(
+    "add",
+    addLogFileAndSetTails,
+  );
+} else {
+  if (entries.length === 0) {
+    console.error("No log files found");
+    process.exit(1);
+  }
+}
 
 const colorNames = [
   // "red",
@@ -142,7 +191,8 @@ const suppressLogDateRe = /^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2} /;
  * @param {number} index
  */
 function tail(path, index) {
-  new Tail(path, { follow: true }).on("line", (line) => {
+  const tail = new Tail(path, { follow: true });
+  tail.on("line", (line) => {
     if (options.filter && !options.filter(line)) return;
     if (options.ignoreBlankLines && line.length === 0) return;
     const indexColor = colorNames[index % colorNames.length];
@@ -177,11 +227,7 @@ function tail(path, index) {
       colors[indexColor](`${formatedTimestamp()} [${index}] ${line}`),
     );
   });
-}
-
-for (let i = 0; i < targetEntries.length; i++) {
-  const entry = targetEntries[i];
-  tail(entry.path, i);
+  return tail;
 }
 
 const stdin = process.stdin;
