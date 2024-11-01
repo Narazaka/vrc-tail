@@ -10,14 +10,18 @@ const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 program
   .option("-f, --filter <str>", "filter")
   .option("-s, --ignore-blank-lines", "ignoreBlankLines")
+  .option("-l, --no-colored-log-level", "noColoredLogLevel")
+  .option("-d, --suppress-log-date", "suppressLogDate")
   .parse();
 
 /**
- * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean}}
+ * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean}}
  */
 const options = {
   filter: program.opts().filter,
   ignoreBlankLines: false,
+  coloredLogLevel: true,
+  suppressLogDate: false,
 };
 
 const programOptions = program.opts();
@@ -26,6 +30,16 @@ if (programOptions.filter) {
 }
 if (programOptions.ignoreBlankLines) {
   options.ignoreBlankLines = true;
+}
+if (programOptions.noColoredLogLevel) {
+  options.coloredLogLevel = false;
+}
+if (programOptions.suppressLogDate) {
+  options.suppressLogDate = true;
+}
+
+function formatedTimestamp() {
+  return formatTimestamp(new Date());
 }
 
 /**
@@ -110,6 +124,18 @@ const colorNames = [
   "gray",
 ];
 
+const logLevelColors = {
+  Log: "blue",
+  Warning: "yellow",
+  Error: "red",
+  Exception: "red",
+};
+
+const logLevelRe =
+  /^(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}) (Log|Warning|Error|Exception)/;
+
+const suppressLogDateRe = /^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2} /;
+
 /**
  *
  * @param {string} path
@@ -119,10 +145,36 @@ function tail(path, index) {
   new Tail(path, { follow: true }).on("line", (line) => {
     if (options.filter && !options.filter(line)) return;
     if (options.ignoreBlankLines && line.length === 0) return;
+    const indexColor = colorNames[index % colorNames.length];
+    if (options.coloredLogLevel) {
+      const m = logLevelRe.exec(line);
+      if (m) {
+        const logLevelColor = logLevelColors[m[2]];
+        if (logLevelColor) {
+          console.log(
+            colors[indexColor](`${formatedTimestamp()} [${index}] `) +
+              colors[logLevelColor](
+                options.suppressLogDate ? m[2] : `${m[1]} ${m[2]}`,
+              ) +
+              colors[indexColor](line.slice(m[0].length)),
+          );
+          return;
+        }
+      }
+    }
+    if (options.suppressLogDate) {
+      console.log(
+        colors[indexColor](
+          `${formatedTimestamp()} [${index}] ${line.replace(
+            suppressLogDateRe,
+            "",
+          )}`,
+        ),
+      );
+      return;
+    }
     console.log(
-      colors[colorNames[index % colorNames.length]](
-        `${formatTimestamp(new Date())} [${index}] ${line}`,
-      ),
+      colors[indexColor](`${formatedTimestamp()} [${index}] ${line}`),
     );
   });
 }
@@ -165,6 +217,8 @@ stdin.on("data", (data) => {
       console.log(">   ? - show this help");
       console.log(">   q - quit");
       console.log(">   s - toggle ignore blank lines");
+      console.log(">   l - toggle colored log level");
+      console.log(">   d - toggle supress log date");
       console.log(">   /<str> - filter");
       console.log(">   r - reset filter");
       break;
@@ -176,6 +230,14 @@ stdin.on("data", (data) => {
       process.stdout.write(
         `> ignoreBlankLines = ${options.ignoreBlankLines}\n`,
       );
+      break;
+    case "l":
+      options.coloredLogLevel = !options.coloredLogLevel;
+      process.stdout.write(`> coloredLogLevel = ${options.coloredLogLevel}\n`);
+      break;
+    case "d":
+      options.suppressLogDate = !options.suppressLogDate;
+      process.stdout.write(`> suppressLogDate = ${options.suppressLogDate}\n`);
       break;
     case "r":
       options.filter = undefined;
