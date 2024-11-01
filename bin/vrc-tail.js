@@ -273,6 +273,12 @@ stdin.on("data", (data) => {
       console.log(">   /<str> - filter");
       console.log(">   r - reset filter");
       break;
+    case "\r":
+      process.stdout.write("\n");
+      break;
+    case "\n":
+      process.stdout.write("\n");
+      break;
     case "q":
       process.exit(0);
       break;
