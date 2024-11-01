@@ -7,18 +7,25 @@ const { Tail } = require("tail");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 
-program.option("-f, --filter <str>", "filter").parse();
+program
+  .option("-f, --filter <str>", "filter")
+  .option("-s, --ignore-blank-lines", "ignoreBlankLines")
+  .parse();
 
 /**
- * @type {{filter?: (line: string) => boolean}}
+ * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean}}
  */
 const options = {
   filter: program.opts().filter,
+  ignoreBlankLines: false,
 };
 
 const programOptions = program.opts();
 if (programOptions.filter) {
   options.filter = (line) => line.includes(programOptions.filter);
+}
+if (programOptions.ignoreBlankLines) {
+  options.ignoreBlankLines = true;
 }
 
 /**
@@ -103,8 +110,6 @@ const colorNames = [
   "gray",
 ];
 
-let ignoreBlankLines = false;
-
 /**
  *
  * @param {string} path
@@ -113,7 +118,7 @@ let ignoreBlankLines = false;
 function tail(path, index) {
   new Tail(path, { follow: true }).on("line", (line) => {
     if (options.filter && !options.filter(line)) return;
-    if (ignoreBlankLines && line.length === 0) return;
+    if (options.ignoreBlankLines && line.length === 0) return;
     console.log(
       colors[colorNames[index % colorNames.length]](
         `${formatTimestamp(new Date())} [${index}] ${line}`,
@@ -159,16 +164,18 @@ stdin.on("data", (data) => {
       console.log("> Commands:");
       console.log(">   ? - show this help");
       console.log(">   q - quit");
-      console.log(">   n - toggle ignore blank lines");
+      console.log(">   s - toggle ignore blank lines");
       console.log(">   /<str> - filter");
       console.log(">   r - reset filter");
       break;
     case "q":
       process.exit(0);
       break;
-    case "n":
-      ignoreBlankLines = !ignoreBlankLines;
-      process.stdout.write(`> ignoreBlankLines = ${ignoreBlankLines}\n`);
+    case "s":
+      options.ignoreBlankLines = !options.ignoreBlankLines;
+      process.stdout.write(
+        `> ignoreBlankLines = ${options.ignoreBlankLines}\n`,
+      );
       break;
     case "r":
       options.filter = undefined;

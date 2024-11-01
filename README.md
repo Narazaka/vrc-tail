@@ -22,7 +22,7 @@ Download from [Release page](https://github.com/Narazaka/vrc-tail/releases/lates
 > Commands:
 >   ? - show this help
 >   q - quit
->   n - toggle ignore blank lines
+>   s - toggle ignore blank lines
 >   /<str> - filter
 >   r - reset filter
 ```
