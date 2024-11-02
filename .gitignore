@@ -1,4 +1,3 @@
 node_modules
 *.exe
-/manifest/winget/generated/*
-!/manifest/winget/generated/.keep
+/manifest/winget/generated
