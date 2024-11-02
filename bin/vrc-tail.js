@@ -151,6 +151,11 @@ function addLogFileAndSetTails(filepath) {
   setTails();
 }
 
+if (!fs.existsSync(dir)) {
+  console.error(`Log directory [${dir}] not found`);
+  process.exit(1);
+}
+
 for (const filename of fs.readdirSync(dir)) {
   addLogFile(path.join(dir, filename));
 }
