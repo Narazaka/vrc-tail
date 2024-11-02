@@ -1,0 +1,14 @@
+# Created using wingetcreate 1.6.5.0
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: Narazaka.vrc-tail
+PackageVersion: PACKAGE_VERSION
+InstallerType: portable
+Commands:
+  - vrc-tail
+Installers:
+  - InstallerUrl: https://github.com/Narazaka/vrc-tail/releases/download/vPACKAGE_VERSION/vrc-tail.exe
+    Architecture: x64
+    InstallerSha256: PACKAGE_HASH
+ManifestType: installer
+ManifestVersion: 1.6.0
