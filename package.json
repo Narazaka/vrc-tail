@@ -7,7 +7,8 @@
   },
   "scripts": {
     "build": "pkg . -t node22-win-x64",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "make-manifest": "node ./scripts/makeManifest.mjs"
   },
   "dependencies": {
     "chokidar": "^4.0.1",
