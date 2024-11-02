@@ -34,4 +34,4 @@ jobs:
       - name: Submit package to Windows Package Manager Community Repository
         run: |
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-          .\wingetcreate.exe submit --replace --token "${{ secrets.WINGET_PAT }}" manifest/winget/generated
+          .\wingetcreate.exe submit --token "${{ secrets.WINGET_PAT }}" manifest/winget/generated
