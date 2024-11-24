@@ -5,10 +5,12 @@ const colors = require("colors/safe");
 const { program } = require("commander");
 const { Tail } = require("tail");
 const { watch } = require("chokidar");
+const { version } = require("../package.json");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 
 program
+  .version(version)
   .option("-f, --filter <str>", "filter")
   .option("-s, --ignore-blank-lines", "ignore blank lines")
   .option("-L, --no-colored-log-level", "no colored log level")
