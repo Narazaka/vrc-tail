@@ -1,4 +1,4 @@
-name: Build
+name: Winget Publish
 
 on:
   workflow_dispatch:
