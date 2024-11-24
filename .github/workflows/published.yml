@@ -1,0 +1,37 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  sync-repo:
+    name: Sync winget-pkgs repo
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh repo sync Narazaka/winget-pkgs -b master
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PAT }}
+
+  winget:
+    name: Publish winget package
+    needs: sync-repo
+    runs-on: windows-latest
+    steps:
+      - name: Submit package to Windows Package Manager Community Repository
+        run: |
+
+          $packageId = "Narazaka.vrc-tail"
+          $gitToken = "${{ secrets.WINGET_PAT }}"
+          $gitTag = "${{ github.ref_name }}".TrimStart('refs/tags/')
+
+          # Fetching latest release from GitHub
+          $github = Invoke-RestMethod -uri "https://api.github.com/repos/${{ github.repository }}/releases"
+          $targetRelease = $github | Where-Object -Property tag_name -eq $gitTag | Select-Object -First 1
+          $installerUrl = $targetRelease | Select-Object -ExpandProperty assets -First 1 | Where-Object -Property name -match '.*\.exe' | Select-Object -ExpandProperty browser_download_url
+          $packageVersion = $targetRelease.tag_name.Trim("v")
+
+          # Update package using wingetcreate
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update $packageId --version $packageVersion --urls "$installerUrl" --submit --token $gitToken
