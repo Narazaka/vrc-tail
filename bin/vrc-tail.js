@@ -5,7 +5,7 @@ const colors = require("colors/safe");
 const { program } = require("commander");
 const { Tail } = require("tail");
 const { watch } = require("chokidar");
-const { escapeRegExp } = require("es-toolkit/string");
+const { escapeRegExp } = require("es-toolkit");
 const { version } = require("../package.json");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
