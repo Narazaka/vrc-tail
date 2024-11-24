@@ -5,6 +5,7 @@ const colors = require("colors/safe");
 const { program } = require("commander");
 const { Tail } = require("tail");
 const { watch } = require("chokidar");
+const { escapeRegExp } = require("es-toolkit/string");
 const { version } = require("../package.json");
 
 const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
@@ -12,6 +13,7 @@ const dir = path.normalize(`${process.env.LOCALAPPDATA}Low\\VRChat\\VRChat`);
 program
   .version(version)
   .option("-f, --filter <str>", "filter")
+  .option("-c, --case-sensitive", "case sensitive")
   .option("-s, --ignore-blank-lines", "ignore blank lines")
   .option("-L, --no-colored-log-level", "no colored log level")
   .option("-d, --suppress-log-date", "suppress log date")
@@ -20,10 +22,11 @@ program
   .parse();
 
 /**
- * @type {{filter?: (line: string) => boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean; watch: boolean; groupPediod: number}}
+ * @type {{filter?: (line: string) => boolean; caseSensitive: boolean; ignoreBlankLines: boolean; coloredLogLevel: boolean; suppressLogDate: boolean; watch: boolean; groupPediod: number}}
  */
 const options = {
   filter: program.opts().filter,
+  caseSensitive: false,
   ignoreBlankLines: false,
   coloredLogLevel: true,
   suppressLogDate: false,
@@ -34,6 +37,9 @@ const options = {
 const programOptions = program.opts();
 if (programOptions.filter) {
   options.filter = (line) => line.includes(programOptions.filter);
+}
+if (programOptions.caseSensitive) {
+  options.caseSensitive = true;
 }
 if (programOptions.ignoreBlankLines) {
   options.ignoreBlankLines = true;
@@ -258,7 +264,11 @@ stdin.on("data", (data) => {
   if (isFilterInput) {
     if (key === "\r" || key === "\n") {
       const filter = filterInput;
-      options.filter = (line) => line.includes(filter);
+      const ignoreCaseFilter = new RegExp(escapeRegExp(filter), "i");
+      options.filter = (line) =>
+        options.caseSensitive
+          ? line.includes(filter)
+          : ignoreCaseFilter.test(line);
       isFilterInput = false;
       filterInput = "";
       process.stdout.write("\n");
@@ -274,6 +284,7 @@ stdin.on("data", (data) => {
       console.log("> Commands:");
       console.log(">   ? - show this help");
       console.log(">   q - quit");
+      console.log(">   c - toggle case sensitive");
       console.log(">   s - toggle ignore blank lines");
       console.log(">   l - toggle colored log level");
       console.log(">   d - toggle supress log date");
@@ -288,6 +299,10 @@ stdin.on("data", (data) => {
       break;
     case "q":
       process.exit(0);
+      break;
+    case "c":
+      options.caseSensitive = !options.caseSensitive;
+      process.stdout.write(`> caseSensitive = ${options.caseSensitive}\n`);
       break;
     case "s":
       options.ignoreBlankLines = !options.ignoreBlankLines;
