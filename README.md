@@ -14,6 +14,14 @@ tail -f for VRChat logs
 
 ## Install
 
+### Winget
+
+```
+winget install Narazaka.vrc-tail
+```
+
+### Portable
+
 Download from [Release page](https://github.com/Narazaka/vrc-tail/releases/latest) and place somewhere.
 
 ## Console Commands
