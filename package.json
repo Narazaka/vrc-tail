@@ -1,6 +1,6 @@
 {
   "name": "vrc-tail",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "tail -f for VRChat logs",
   "bin": {
     "vrc-tail": "./bin/vrc-tail.js"
