@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -118,6 +119,129 @@ fn scan_group(dir: &Path, period: i64) -> io::Result<Vec<LogEntry>> {
 }
 
 fn main() {}
+
+#[allow(dead_code)]
+struct ActiveFile {
+    entry: LogEntry,
+    index: usize,
+    file: File,
+    offset: u64,
+    pending: Vec<u8>,
+}
+
+#[allow(dead_code)]
+struct TailSet {
+    files: Vec<ActiveFile>,
+    read_buffer: Box<[u8; 16 * 1024]>,
+}
+
+impl Default for TailSet {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            read_buffer: Box::new([0; 16 * 1024]),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl TailSet {
+    fn open_initial(mut group: Vec<LogEntry>) -> io::Result<Self> {
+        group.sort_by_key(|entry| entry.time);
+        let mut tails = Self::default();
+        for (index, entry) in group.into_iter().enumerate() {
+            let mut file = File::open(&entry.path)?;
+            let offset = file.seek(SeekFrom::End(0))?;
+            tails.files.push(ActiveFile {
+                entry,
+                index,
+                file,
+                offset,
+                pending: Vec::new(),
+            });
+        }
+        Ok(tails)
+    }
+
+    fn reconcile<W: Write>(
+        &mut self,
+        mut group: Vec<LogEntry>,
+        warnings: &mut W,
+    ) -> io::Result<()> {
+        group.sort_by_key(|entry| entry.time);
+        let reset = !self.files.is_empty()
+            && !group.iter().any(|entry| {
+                self.files
+                    .iter()
+                    .any(|active| active.entry.path == entry.path)
+            });
+        if reset {
+            self.files.clear();
+            writeln!(warnings, "{}", "-".repeat(79))?;
+        }
+
+        let mut previous = std::mem::take(&mut self.files);
+        for (index, entry) in group.into_iter().enumerate() {
+            if let Some(position) = previous
+                .iter()
+                .position(|active| active.entry.path == entry.path)
+            {
+                let mut active = previous.remove(position);
+                active.entry = entry;
+                active.index = index;
+                self.files.push(active);
+                continue;
+            }
+            match File::open(&entry.path) {
+                Ok(file) => self.files.push(ActiveFile {
+                    entry,
+                    index,
+                    file,
+                    offset: 0,
+                    pending: Vec::new(),
+                }),
+                Err(error) => {
+                    writeln!(warnings, "failed to open {}: {error}", entry.path.display())?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain<W: Write>(
+        &mut self,
+        config: &Config,
+        color_output: bool,
+        out: &mut W,
+    ) -> io::Result<()> {
+        for active in &mut self.files {
+            if active.file.metadata()?.len() < active.offset {
+                active.file.seek(SeekFrom::Start(0))?;
+                active.offset = 0;
+                active.pending.clear();
+            }
+            active.file.seek(SeekFrom::Start(active.offset))?;
+            loop {
+                let read = active.file.read(&mut *self.read_buffer)?;
+                if read == 0 {
+                    break;
+                }
+                active.offset += read as u64;
+                consume_lines(&mut active.pending, &self.read_buffer[..read], |line| {
+                    write_line(
+                        out,
+                        line,
+                        active.index,
+                        config,
+                        color_output,
+                        &formatted_timestamp(),
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[allow(dead_code)]
 fn consume_lines<E>(
@@ -289,6 +413,31 @@ fn write_line<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn test_dir(suffix: &str) -> PathBuf {
+        let root = std::env::temp_dir();
+        let dir = root.join(format!("vrc-tail-test-{}-{suffix}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert!(dir.canonicalize().unwrap().starts_with(root));
+        dir
+    }
+
+    fn remove_test_dir(dir: PathBuf) {
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        assert!(dir.canonicalize().unwrap().starts_with(root));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn test_log(dir: &Path, index: usize) -> LogEntry {
+        let path = dir.join(format!("output_log_2026-09-05_12-00-{index:02}.txt"));
+        fs::write(&path, []).unwrap();
+        LogEntry {
+            path,
+            time: index as i64,
+        }
+    }
 
     fn seconds(hour: u32, minute: u32, second: u32) -> i64 {
         civil_seconds(2026, 9, 5, hour, minute, second).unwrap()
@@ -441,5 +590,78 @@ mod tests {
         )
         .unwrap();
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn initial_content_is_skipped_and_appended_content_is_printed_once() {
+        let dir = test_dir("initial-and-append");
+        let entry = test_log(&dir, 0);
+        fs::write(&entry.path, "old\n").unwrap();
+        let mut tails = TailSet::open_initial(vec![entry.clone()]).unwrap();
+        let mut output = Vec::new();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        assert!(output.is_empty());
+
+        fs::write(&entry.path, "old\nnew\n").unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("old\n"));
+        assert_eq!(output.matches("new\n").count(), 1);
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn newly_discovered_file_is_read_from_byte_zero() {
+        let dir = test_dir("new-file");
+        let first = test_log(&dir, 0);
+        let second = test_log(&dir, 1);
+        fs::write(&second.path, "new file\n").unwrap();
+        let mut tails = TailSet::open_initial(vec![first]).unwrap();
+        let mut output = Vec::new();
+        tails.reconcile(vec![second], &mut io::sink()).unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .ends_with(" [0] new file\n")
+        );
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn truncation_reads_the_replacement_from_byte_zero() {
+        let dir = test_dir("truncation");
+        let entry = test_log(&dir, 0);
+        fs::write(&entry.path, "before\n").unwrap();
+        let mut tails = TailSet::open_initial(vec![entry.clone()]).unwrap();
+        fs::write(&entry.path, "after\n").unwrap();
+        let mut output = Vec::new();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        assert!(String::from_utf8(output).unwrap().ends_with(" [0] after\n"));
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn repeated_rotations_retain_only_the_current_group() {
+        let dir = test_dir("rotations");
+        let mut tails = TailSet::default();
+        for i in 0..1_000 {
+            tails
+                .reconcile(vec![test_log(&dir, i)], &mut io::sink())
+                .unwrap();
+            assert_eq!(tails.files.len(), 1);
+        }
+        remove_test_dir(dir);
     }
 }
