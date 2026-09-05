@@ -213,7 +213,9 @@ impl InputState {
         config: &mut Config,
         out: &mut W,
     ) -> io::Result<InputAction> {
-        if let Some(high) = self.high_surrogate.take() {
+        if unit == 0 {
+            Ok(InputAction::Continue)
+        } else if let Some(high) = self.high_surrogate.take() {
             let mut action = InputAction::Continue;
             for decoded in char::decode_utf16([high, unit]) {
                 action =
@@ -238,6 +240,9 @@ impl InputState {
         config: &mut Config,
         out: &mut W,
     ) -> io::Result<InputAction> {
+        if character == '\u{3}' {
+            return Ok(InputAction::Quit);
+        }
         if self.entering_filter {
             if matches!(character, '\r' | '\n') {
                 self.entering_filter = false;
@@ -254,7 +259,7 @@ impl InputState {
             return Ok(InputAction::Continue);
         }
         match character {
-            '\u{3}' | 'q' => Ok(InputAction::Quit),
+            'q' => Ok(InputAction::Quit),
             '?' => write_help(out).map(|()| InputAction::Continue),
             '\r' | '\n' => writeln!(out).map(|()| InputAction::Continue),
             'c' => {
@@ -405,8 +410,21 @@ impl Drop for ConsoleModes {
 fn vrchat_log_dir() -> io::Result<PathBuf> {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .map(|path| path.join("Low").join("VRChat").join("VRChat"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))
+        .and_then(|path| vrchat_log_dir_from_local_app_data(&path))
+}
+
+fn vrchat_log_dir_from_local_app_data(path: &Path) -> io::Result<PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "LOCALAPPDATA has no name"))?
+        .to_os_string();
+    name.push("Low");
+    Ok(path.with_file_name(name).join("VRChat").join("VRChat"))
+}
+
+fn flush_before_wait<W: Write>(out: &mut W) -> io::Result<()> {
+    out.flush()
 }
 
 fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
@@ -418,7 +436,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
             "No log files found",
         ));
     }
-    let mut tails = TailSet::open_initial(group)?;
+    let fixed_group = (!config.watch_new_files).then(|| group.clone());
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let modes = ConsoleModes::new(stdin, stdout)?;
@@ -426,6 +444,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
     let color_output = modes.output.is_some() && io::stdout().is_terminal();
     let stdout = io::stdout();
     let mut output = stdout.lock();
+    let mut tails = TailSet::open_initial(group, &mut output)?;
     let mut input = InputState::default();
 
     loop {
@@ -433,6 +452,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
         if let Some(handle) = console_input {
             handles.push(handle);
         }
+        flush_before_wait(&mut output)?;
         let result =
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
         if result == WAIT_FAILED {
@@ -443,7 +463,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
             if config.watch_new_files {
                 tails.reconcile(scan_group(dir, config.group_period_secs)?, &mut output)?;
             } else {
-                tails.files.retain(|active| active.entry.path.exists());
+                tails.reconcile(fixed_group.clone().unwrap_or_default(), &mut output)?;
             }
             tails.drain(&config, color_output, &mut output)?;
             continue;
@@ -558,19 +578,27 @@ impl Default for TailSet {
 
 #[allow(dead_code)]
 impl TailSet {
-    fn open_initial(mut group: Vec<LogEntry>) -> io::Result<Self> {
+    fn open_initial<W: Write>(mut group: Vec<LogEntry>, warnings: &mut W) -> io::Result<Self> {
         group.sort_by_key(|entry| entry.time);
         let mut tails = Self::default();
         for (index, entry) in group.into_iter().enumerate() {
-            let mut file = File::open(&entry.path)?;
-            let offset = file.seek(SeekFrom::End(0))?;
-            tails.files.push(ActiveFile {
-                entry,
-                index,
-                file,
-                offset,
-                pending: Vec::new(),
-            });
+            match File::open(&entry.path) {
+                Ok(mut file) => match file.seek(SeekFrom::End(0)) {
+                    Ok(offset) => tails.files.push(ActiveFile {
+                        entry,
+                        index,
+                        file,
+                        offset,
+                        pending: Vec::new(),
+                    }),
+                    Err(error) => {
+                        writeln!(warnings, "failed to seek {}: {error}", entry.path.display())?
+                    }
+                },
+                Err(error) => {
+                    writeln!(warnings, "failed to open {}: {error}", entry.path.display())?
+                }
+            }
         }
         Ok(tails)
     }
@@ -627,14 +655,49 @@ impl TailSet {
         out: &mut W,
     ) -> io::Result<()> {
         for active in &mut self.files {
-            if active.file.metadata()?.len() < active.offset {
-                active.file.seek(SeekFrom::Start(0))?;
+            let length = match active.file.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    writeln!(
+                        out,
+                        "failed to read metadata for {}: {error}",
+                        active.entry.path.display()
+                    )?;
+                    continue;
+                }
+            };
+            if length < active.offset {
+                if let Err(error) = active.file.seek(SeekFrom::Start(0)) {
+                    writeln!(
+                        out,
+                        "failed to seek {}: {error}",
+                        active.entry.path.display()
+                    )?;
+                    continue;
+                }
                 active.offset = 0;
-                active.pending.clear();
+                active.pending = Vec::new();
             }
-            active.file.seek(SeekFrom::Start(active.offset))?;
+            if let Err(error) = active.file.seek(SeekFrom::Start(active.offset)) {
+                writeln!(
+                    out,
+                    "failed to seek {}: {error}",
+                    active.entry.path.display()
+                )?;
+                continue;
+            }
             loop {
-                let read = active.file.read(&mut *self.read_buffer)?;
+                let read = match active.file.read(&mut *self.read_buffer) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        writeln!(
+                            out,
+                            "failed to read {}: {error}",
+                            active.entry.path.display()
+                        )?;
+                        break;
+                    }
+                };
                 if read == 0 {
                     break;
                 }
@@ -777,7 +840,7 @@ fn write_line<W: Write>(
     }
     let prefix = format!("{timestamp} [{index}] ");
     if color_output {
-        let index_code = [32, 35, 36, 37, 90][index % 5];
+        let index_code = [32, 34, 35, 36, 37, 90][index % 6];
         if config.colored_log_level
             && let Some((level, suffix)) = log_level(line)
         {
@@ -825,15 +888,46 @@ fn write_line<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct FlushWriter {
+        bytes: Vec<u8>,
+        flushed: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for FlushWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::Error::other("flush failed"));
+            }
+            self.flushed = true;
+            Ok(())
+        }
+    }
 
     fn test_dir(suffix: &str) -> PathBuf {
-        let root = std::env::temp_dir();
-        let dir = root.join(format!("vrc-tail-test-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let root = root.canonicalize().unwrap();
-        assert!(dir.canonicalize().unwrap().starts_with(root));
-        dir
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let dir = root.join(format!(
+                "vrc-tail-test-{}-{suffix}-{id}",
+                std::process::id()
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("failed to create {}: {error}", dir.display()),
+            }
+        }
     }
 
     fn remove_test_dir(dir: PathBuf) {
@@ -863,6 +957,24 @@ mod tests {
     #[test]
     fn rejects_non_log_name() {
         assert!(parse_log_name(OsStr::new("readme.txt"), PathBuf::from("readme.txt")).is_none());
+    }
+
+    #[test]
+    fn resolves_vrchat_under_local_low_sibling() {
+        let root = test_dir("local-low");
+        let local = root.join("Local");
+        let expected = root.join("LocalLow").join("VRChat").join("VRChat");
+        fs::create_dir(&local).unwrap();
+        fs::create_dir_all(&expected).unwrap();
+        assert_eq!(
+            vrchat_log_dir_from_local_app_data(&local).unwrap(),
+            expected
+        );
+        assert_ne!(
+            vrchat_log_dir_from_local_app_data(&local).unwrap(),
+            local.join("Low").join("VRChat").join("VRChat")
+        );
+        remove_test_dir(root);
     }
 
     #[test]
@@ -1093,6 +1205,59 @@ mod tests {
     }
 
     #[test]
+    fn zero_unicode_key_events_do_not_enter_the_filter() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = Vec::new();
+        for unit in ['/' as u16, 0, 'x' as u16, '\r' as u16] {
+            state.handle_utf16(unit, &mut config, &mut output).unwrap();
+        }
+        assert_eq!(config.filter.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn control_c_quits_while_q_remains_literal_in_a_filter() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = Vec::new();
+        state
+            .handle_utf16('/' as u16, &mut config, &mut output)
+            .unwrap();
+        assert_eq!(
+            state
+                .handle_utf16('q' as u16, &mut config, &mut output)
+                .unwrap(),
+            InputAction::Continue
+        );
+        assert_eq!(state.text, "q");
+        assert_eq!(
+            state.handle_utf16(3, &mut config, &mut output).unwrap(),
+            InputAction::Quit
+        );
+    }
+
+    #[test]
+    fn interactive_output_is_flushed_before_waiting() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = FlushWriter::default();
+        state
+            .handle_utf16('/' as u16, &mut config, &mut output)
+            .unwrap();
+        assert_eq!(output.bytes, b"/");
+        assert!(!output.flushed);
+        flush_before_wait(&mut output).unwrap();
+        assert!(output.flushed);
+
+        let error = flush_before_wait(&mut FlushWriter {
+            fail_flush: true,
+            ..FlushWriter::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
     fn assembles_crlf_and_split_utf8_without_retaining_complete_lines() {
         let mut pending = Vec::new();
         let mut lines = Vec::new();
@@ -1170,11 +1335,50 @@ mod tests {
     }
 
     #[test]
+    fn cycles_through_the_legacy_file_colors() {
+        let mut output = Vec::new();
+        for index in 0..7 {
+            write_line(
+                &mut output,
+                "line",
+                index,
+                &config(None, true, false, false),
+                true,
+                "now",
+            )
+            .unwrap();
+        }
+        let output = String::from_utf8(output).unwrap();
+        let colors = output.lines().map(|line| &line[2..4]).collect::<Vec<_>>();
+        assert_eq!(colors, ["32", "34", "35", "36", "37", "90", "32"]);
+    }
+
+    #[test]
+    fn timestamp_has_fixed_zero_padded_shape() {
+        let timestamp = formatted_timestamp();
+        assert_eq!(timestamp.len(), 24);
+        for index in [4, 7, 10, 13, 16, 19] {
+            assert!(matches!(
+                timestamp.as_bytes()[index],
+                b'-' | b' ' | b':' | b'.'
+            ));
+        }
+        assert!(
+            timestamp
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19)
+                    || byte.is_ascii_digit())
+        );
+        assert_eq!(timestamp.as_bytes()[20], b'0');
+    }
+
+    #[test]
     fn initial_content_is_skipped_and_appended_content_is_printed_once() {
         let dir = test_dir("initial-and-append");
         let entry = test_log(&dir, 0);
         fs::write(&entry.path, "old\n").unwrap();
-        let mut tails = TailSet::open_initial(vec![entry.clone()]).unwrap();
+        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
         let mut output = Vec::new();
         tails
             .drain(&config(None, true, false, false), false, &mut output)
@@ -1195,12 +1399,39 @@ mod tests {
     }
 
     #[test]
+    fn initial_open_failure_warns_and_is_retried_by_reconciliation() {
+        let dir = test_dir("initial-open-recovery");
+        let missing = test_log(&dir, 0);
+        let good = test_log(&dir, 1);
+        fs::remove_file(&missing.path).unwrap();
+        let group = vec![missing.clone(), good];
+        let mut warnings = Vec::new();
+        let mut tails = TailSet::open_initial(group.clone(), &mut warnings).unwrap();
+        assert_eq!(tails.files.len(), 1);
+        assert!(String::from_utf8_lossy(&warnings).contains("failed to open"));
+
+        fs::write(&missing.path, "recovered\n").unwrap();
+        tails.reconcile(group, &mut warnings).unwrap();
+        assert_eq!(tails.files.len(), 2);
+        let mut output = Vec::new();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains(" [0] recovered\n")
+        );
+        remove_test_dir(dir);
+    }
+
+    #[test]
     fn newly_discovered_file_is_read_from_byte_zero() {
         let dir = test_dir("new-file");
         let first = test_log(&dir, 0);
         let second = test_log(&dir, 1);
         fs::write(&second.path, "new file\n").unwrap();
-        let mut tails = TailSet::open_initial(vec![first]).unwrap();
+        let mut tails = TailSet::open_initial(vec![first], &mut io::sink()).unwrap();
         let mut output = Vec::new();
         tails.reconcile(vec![second], &mut io::sink()).unwrap();
         tails
@@ -1219,7 +1450,7 @@ mod tests {
         let dir = test_dir("truncation");
         let entry = test_log(&dir, 0);
         fs::write(&entry.path, "before\n").unwrap();
-        let mut tails = TailSet::open_initial(vec![entry.clone()]).unwrap();
+        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
         fs::write(&entry.path, "after\n").unwrap();
         let mut output = Vec::new();
         tails
@@ -1227,6 +1458,83 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8(output).unwrap().ends_with(" [0] after\n"));
         remove_test_dir(dir);
+    }
+
+    #[test]
+    fn truncation_releases_an_oversized_unfinished_line() {
+        let dir = test_dir("truncation-capacity");
+        let entry = test_log(&dir, 0);
+        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
+        fs::write(&entry.path, vec![b'x'; 8 * 1024]).unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut io::sink())
+            .unwrap();
+        assert!(tails.files[0].pending.capacity() > 4 * 1024);
+
+        fs::write(&entry.path, []).unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut io::sink())
+            .unwrap();
+        assert_eq!(tails.files[0].pending.capacity(), 0);
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn a_read_failure_does_not_stop_other_files_and_can_recover() {
+        let dir = test_dir("read-recovery");
+        let bad = test_log(&dir, 0);
+        let good = test_log(&dir, 1);
+        fs::write(&bad.path, "recovered\n").unwrap();
+        fs::write(&good.path, "good\n").unwrap();
+        let write_only = OpenOptions::new().write(true).open(&bad.path).unwrap();
+        let mut tails = TailSet {
+            files: vec![
+                ActiveFile {
+                    entry: bad.clone(),
+                    index: 0,
+                    file: write_only,
+                    offset: 0,
+                    pending: Vec::new(),
+                },
+                ActiveFile {
+                    entry: good.clone(),
+                    index: 1,
+                    file: File::open(&good.path).unwrap(),
+                    offset: 0,
+                    pending: Vec::new(),
+                },
+            ],
+            ..TailSet::default()
+        };
+        let mut output = Vec::new();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        let first = String::from_utf8_lossy(&output);
+        assert!(first.contains("failed to read"));
+        assert!(first.contains(" [1] good\n"));
+
+        tails.files[0].file = File::open(&bad.path).unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains(" [0] recovered\n")
+        );
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn test_directories_never_reuse_an_existing_path() {
+        let first = test_dir("unique");
+        fs::write(first.join("sentinel"), []).unwrap();
+        let second = test_dir("unique");
+        assert_ne!(first, second);
+        assert!(first.join("sentinel").exists());
+        remove_test_dir(first);
+        remove_test_dir(second);
     }
 
     #[test]
@@ -1272,7 +1580,7 @@ mod tests {
     fn drained_large_line_releases_pending_capacity() {
         let dir = test_dir("pending-capacity");
         let entry = test_log(&dir, 0);
-        let mut tails = TailSet::open_initial(vec![entry.clone()]).unwrap();
+        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
         let mut line = vec![b'x'; 8 * 1024];
         line.push(b'\n');
         fs::write(&entry.path, line).unwrap();

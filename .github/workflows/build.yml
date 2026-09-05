@@ -18,11 +18,12 @@ jobs:
         run: |
           rustup default stable
           rustup component add clippy rustfmt
-      - name: Check
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --target x86_64-pc-windows-msvc -- -D warnings
-          cargo test --locked --target x86_64-pc-windows-msvc
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Test
+        run: cargo test --locked --target x86_64-pc-windows-msvc
       - name: Build
         run: |
           cargo build --release --locked --target x86_64-pc-windows-msvc
