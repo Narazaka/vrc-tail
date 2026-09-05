@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -119,6 +119,159 @@ fn scan_group(dir: &Path, period: i64) -> io::Result<Vec<LogEntry>> {
 
 fn main() {}
 
+#[allow(dead_code)]
+fn consume_lines<E>(
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+    mut emit: impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    pending.extend_from_slice(bytes);
+    let mut consumed = 0;
+    while let Some(relative_end) = pending[consumed..].iter().position(|&byte| byte == b'\n') {
+        let end = consumed + relative_end;
+        let line_end = if end > consumed && pending[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        let line = String::from_utf8_lossy(&pending[consumed..line_end]);
+        emit(&line)?;
+        consumed = end + 1;
+    }
+    if consumed != 0 {
+        pending.drain(..consumed);
+        if pending.capacity() > 64 * 1024 && pending.len() < 4 * 1024 {
+            pending.shrink_to(4 * 1024);
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn line_matches(line: &str, config: &Config) -> bool {
+    let Some(filter) = config.filter.as_deref() else {
+        return true;
+    };
+    if config.case_sensitive {
+        line.contains(filter)
+    } else {
+        line.to_lowercase().contains(&filter.to_lowercase())
+    }
+}
+
+#[allow(dead_code)]
+fn strip_log_date(line: &str) -> &str {
+    if has_log_date_prefix(line) {
+        &line[20..]
+    } else {
+        line
+    }
+}
+
+#[allow(dead_code)]
+fn log_level(line: &str) -> Option<(&str, &str)> {
+    if !has_log_date_prefix(line) {
+        return None;
+    }
+    let rest = &line[20..];
+    ["Warning", "Exception", "Error", "Log"]
+        .iter()
+        .find_map(|level| rest.strip_prefix(level).map(|suffix| (*level, suffix)))
+}
+
+#[allow(dead_code)]
+fn has_log_date_prefix(line: &str) -> bool {
+    line.len() >= 20
+        && line.as_bytes()[4] == b'.'
+        && line.as_bytes()[7] == b'.'
+        && line.as_bytes()[10] == b' '
+        && line.as_bytes()[13] == b':'
+        && line.as_bytes()[16] == b':'
+        && line.as_bytes()[19] == b' '
+        && line.as_bytes()[..19]
+            .iter()
+            .enumerate()
+            .all(|(i, byte)| matches!(i, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
+}
+
+#[allow(dead_code)]
+fn formatted_timestamp() -> String {
+    let mut now = windows_sys::Win32::Foundation::SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:04}",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds
+    )
+}
+
+#[allow(dead_code)]
+fn write_line<W: Write>(
+    out: &mut W,
+    line: &str,
+    index: usize,
+    config: &Config,
+    color_output: bool,
+    timestamp: &str,
+) -> io::Result<()> {
+    if !line_matches(line, config) || (config.ignore_blank_lines && line.is_empty()) {
+        return Ok(());
+    }
+    let prefix = format!("{timestamp} [{index}] ");
+    if color_output {
+        let index_code = [32, 35, 36, 37, 90][index % 5];
+        if config.colored_log_level
+            && let Some((level, suffix)) = log_level(line)
+        {
+            let level_code = if matches!(level, "Error" | "Exception") {
+                31
+            } else if level == "Warning" {
+                33
+            } else {
+                34
+            };
+            writeln!(
+                out,
+                "\x1b[{index_code}m{prefix}\x1b[0m\x1b[{level_code}m{}\x1b[0m\x1b[{index_code}m{}\x1b[0m",
+                if config.suppress_log_date {
+                    level
+                } else {
+                    &line[0..20 + level.len()]
+                },
+                suffix
+            )?;
+            return Ok(());
+        }
+        writeln!(
+            out,
+            "\x1b[{index_code}m{prefix}{}\x1b[0m",
+            if config.suppress_log_date {
+                strip_log_date(line)
+            } else {
+                line
+            }
+        )
+    } else {
+        writeln!(
+            out,
+            "{prefix}{}",
+            if config.suppress_log_date {
+                strip_log_date(line)
+            } else {
+                line
+            }
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +333,99 @@ mod tests {
     fn validates_leap_days() {
         assert!(civil_seconds(2024, 2, 29, 0, 0, 0).is_some());
         assert!(civil_seconds(2025, 2, 29, 0, 0, 0).is_none());
+    }
+
+    fn config(
+        filter: Option<&str>,
+        case_sensitive: bool,
+        ignore_blank_lines: bool,
+        suppress_log_date: bool,
+    ) -> Config {
+        Config {
+            filter: filter.map(str::to_owned),
+            case_sensitive,
+            ignore_blank_lines,
+            colored_log_level: true,
+            suppress_log_date,
+            watch_new_files: false,
+            group_period_secs: 0,
+        }
+    }
+
+    #[test]
+    fn assembles_crlf_and_split_utf8_without_retaining_complete_lines() {
+        let mut pending = Vec::new();
+        let mut lines = Vec::new();
+        consume_lines(&mut pending, b"hello\r", |line| {
+            lines.push(line.to_owned());
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+        consume_lines(&mut pending, b"\nwarn \xE3\x81", |line| {
+            lines.push(line.to_owned());
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+        consume_lines(&mut pending, b"\x82\n", |line| {
+            lines.push(line.to_owned());
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+        assert_eq!(lines, ["hello", "warn あ"]);
+        assert!(pending.is_empty());
+
+        consume_lines(&mut pending, b"bad \xff\n", |line| {
+            lines.push(line.to_owned());
+            Ok::<_, io::Error>(())
+        })
+        .unwrap();
+        assert_eq!(lines.last().unwrap(), "bad �");
+    }
+
+    #[test]
+    fn filters_dates_levels_blanks_and_formats_without_color() {
+        let sensitive = config(Some("Warn"), true, true, false);
+        assert!(line_matches("Warn here", &sensitive));
+        assert!(!line_matches("warn here", &sensitive));
+        assert!(!line_matches(
+            "anything",
+            &config(Some("missing"), true, true, false)
+        ));
+        assert!(line_matches(
+            "WARN あ",
+            &config(Some("あ"), false, false, false)
+        ));
+        assert_eq!(strip_log_date("2026.09.05 12:34:56 hello"), "hello");
+        assert_eq!(strip_log_date("not dated"), "not dated");
+        assert_eq!(
+            log_level("2026.09.05 12:34:56 Warning details"),
+            Some(("Warning", " details"))
+        );
+        assert_eq!(log_level("2026.09.05 12:34:56 Debug details"), None);
+        let mut output = Vec::new();
+        write_line(
+            &mut output,
+            "2026.09.05 12:34:56 Warning details",
+            2,
+            &config(None, true, false, true),
+            false,
+            "2026-09-05 12:34:56.0000",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "2026-09-05 12:34:56.0000 [2] Warning details\n"
+        );
+        let mut output = Vec::new();
+        write_line(
+            &mut output,
+            "",
+            0,
+            &config(None, true, true, false),
+            false,
+            "now",
+        )
+        .unwrap();
+        assert!(output.is_empty());
     }
 }
