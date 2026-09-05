@@ -358,14 +358,17 @@ impl ConsoleModes {
         let (input, input_changed) = set_console_mode(input, |mode| {
             mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT)
         })?;
+        let mut modes = Self {
+            input,
+            output: None,
+            input_changed,
+            output_changed: false,
+        };
         let (output, output_changed) =
             set_console_mode(output, |mode| mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
-        Ok(Self {
-            input,
-            output,
-            input_changed,
-            output_changed,
-        })
+        modes.output = output;
+        modes.output_changed = output_changed;
+        Ok(modes)
     }
 }
 
@@ -407,6 +410,7 @@ fn vrchat_log_dir() -> io::Result<PathBuf> {
 }
 
 fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
+    let notification = ChangeNotification::new(dir)?;
     let group = scan_group(dir, config.group_period_secs)?;
     if group.is_empty() && !config.watch_new_files {
         return Err(io::Error::new(
@@ -415,7 +419,6 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
         ));
     }
     let mut tails = TailSet::open_initial(group)?;
-    let notification = ChangeNotification::new(dir)?;
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let modes = ConsoleModes::new(stdin, stdout)?;
