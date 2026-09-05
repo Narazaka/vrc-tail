@@ -14,15 +14,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-      - name: Use Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24.x
-          cache: "npm"
-      - name: Install deps
-        run: npm ci
+      - name: Use stable Rust
+        run: |
+          rustup default stable
+          rustup component add clippy rustfmt
+      - name: Check
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --target x86_64-pc-windows-msvc -- -D warnings
+          cargo test --locked --target x86_64-pc-windows-msvc
       - name: Build
-        run: npm run build
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          Copy-Item target/x86_64-pc-windows-msvc/release/vrc-tail.exe vrc-tail.exe
       - name: Release
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
@@ -30,7 +34,7 @@ jobs:
           files: |
             vrc-tail.exe
       - name: make manifest
-        run: npm run make-manifest
+        run: pwsh -NoProfile -File scripts/makeManifest.ps1
       - name: Submit package to Windows Package Manager Community Repository
         run: |
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
