@@ -23,16 +23,33 @@ struct LogEntry {
 fn parse_log_name(name: &OsStr, path: PathBuf) -> Option<LogEntry> {
     let name = name.to_str()?;
     let value = name.strip_prefix("output_log_")?.strip_suffix(".txt")?;
-    let fields = value.split(['-', '_']).collect::<Vec<_>>();
-    if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+    let bytes = value.as_bytes();
+    if bytes.len() != 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'_'
+        || bytes[13] != b'-'
+        || bytes[16] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7 | 10 | 13 | 16) && !byte.is_ascii_digit())
+    {
         return None;
     }
-    let [year, month, day, hour, minute, second]: [&str; 6] = fields.try_into().ok()?;
-    let values = [year, month, day, hour, minute, second]
-        .into_iter()
-        .map(|field| field.parse().ok())
-        .collect::<Option<Vec<u32>>>()?;
-    let [year, month, day, hour, minute, second]: [u32; 6] = values.try_into().ok()?;
+    let [year, month, day, hour, minute, second] = [
+        &value[0..4],
+        &value[5..7],
+        &value[8..10],
+        &value[11..13],
+        &value[14..16],
+        &value[17..19],
+    ]
+    .map(|field| field.parse().ok())
+    .into_iter()
+    .collect::<Option<Vec<u32>>>()?
+    .try_into()
+    .ok()?;
     Some(LogEntry {
         path,
         time: civil_seconds(year.into(), month, day, hour, minute, second)?,
@@ -118,6 +135,12 @@ mod tests {
     #[test]
     fn rejects_non_log_name() {
         assert!(parse_log_name(OsStr::new("readme.txt"), PathBuf::from("readme.txt")).is_none());
+    }
+
+    #[test]
+    fn rejects_log_name_with_wrong_delimiters() {
+        let name = "output_log_2026_09_05_12_00_00.txt";
+        assert!(parse_log_name(OsStr::new(name), PathBuf::from(name)).is_none());
     }
 
     #[test]
