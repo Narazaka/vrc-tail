@@ -98,11 +98,9 @@ fn civil_seconds(
 
 fn latest_group(mut entries: Vec<LogEntry>, period: i64) -> Vec<LogEntry> {
     entries.sort_by_key(|entry| entry.time);
-    let start = entries
-        .windows(2)
-        .rposition(|pair| pair[1].time - pair[0].time > period)
-        .map_or(0, |index| index + 1);
-    entries.drain(..start);
+    if let Some(newest) = entries.last().map(|entry| entry.time) {
+        entries.retain(|entry| entry.time >= newest.saturating_sub(period));
+    }
     entries
 }
 
@@ -264,7 +262,7 @@ fn consume_lines<E>(
     }
     if consumed != 0 {
         pending.drain(..consumed);
-        if pending.capacity() > 64 * 1024 && pending.len() < 4 * 1024 {
+        if pending.capacity() > 4 * 1024 && pending.len() < 4 * 1024 {
             pending.shrink_to(4 * 1024);
         }
     }
@@ -493,6 +491,21 @@ mod tests {
     }
 
     #[test]
+    fn keeps_only_the_fixed_window_below_the_newest_timestamp() {
+        let entries = vec![
+            entry("12-00-00"),
+            entry("12-00-20"),
+            entry("12-00-40"),
+            entry("12-01-00"),
+        ];
+        let group = latest_group(entries, 30);
+        assert_eq!(
+            group.iter().map(|entry| entry.time).collect::<Vec<_>>(),
+            vec![seconds(12, 0, 40), seconds(12, 1, 0)]
+        );
+    }
+
+    #[test]
     fn validates_leap_days() {
         assert!(civil_seconds(2024, 2, 29, 0, 0, 0).is_some());
         assert!(civil_seconds(2025, 2, 29, 0, 0, 0).is_none());
@@ -662,6 +675,47 @@ mod tests {
                 .unwrap();
             assert_eq!(tails.files.len(), 1);
         }
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn chained_groups_drop_handles_outside_the_fixed_window() {
+        let dir = test_dir("bounded-window");
+        let entries = (0..4)
+            .map(|index| LogEntry {
+                time: index * 20,
+                ..test_log(&dir, index as usize)
+            })
+            .collect::<Vec<_>>();
+        let mut tails = TailSet::default();
+        for end in 0..entries.len() {
+            let group = latest_group(entries[..=end].to_vec(), 30);
+            tails.reconcile(group, &mut io::sink()).unwrap();
+            assert!(tails.files.len() <= 2);
+        }
+        assert_eq!(
+            tails
+                .files
+                .iter()
+                .map(|file| file.entry.time)
+                .collect::<Vec<_>>(),
+            vec![40, 60]
+        );
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn drained_large_line_releases_pending_capacity() {
+        let dir = test_dir("pending-capacity");
+        let entry = test_log(&dir, 0);
+        let mut tails = TailSet::open_initial(vec![entry.clone()]).unwrap();
+        let mut line = vec![b'x'; 8 * 1024];
+        line.push(b'\n');
+        fs::write(&entry.path, line).unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut io::sink())
+            .unwrap();
+        assert!(tails.files[0].pending.capacity() <= 4 * 1024);
         remove_test_dir(dir);
     }
 }
