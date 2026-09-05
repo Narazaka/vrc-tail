@@ -155,7 +155,21 @@ fn line_matches(line: &str, config: &Config) -> bool {
     if config.case_sensitive {
         line.contains(filter)
     } else {
-        line.to_lowercase().contains(&filter.to_lowercase())
+        let lowered = line.to_lowercase();
+        if filter.is_empty() {
+            return true;
+        }
+        lowered.char_indices().any(|(start, _)| {
+            let mut candidate = lowered[start..].chars();
+            let mut needle = filter.chars().flat_map(char::to_lowercase);
+            loop {
+                match (needle.next(), candidate.next()) {
+                    (None, _) => return true,
+                    (Some(expected), Some(actual)) if expected == actual => {}
+                    _ => return false,
+                }
+            }
+        })
     }
 }
 
@@ -392,8 +406,8 @@ mod tests {
             &config(Some("missing"), true, true, false)
         ));
         assert!(line_matches(
-            "WARN あ",
-            &config(Some("あ"), false, false, false)
+            "WARN Ångström",
+            &config(Some("å"), false, false, false)
         ));
         assert_eq!(strip_log_date("2026.09.05 12:34:56 hello"), "hello");
         assert_eq!(strip_log_date("not dated"), "not dated");
