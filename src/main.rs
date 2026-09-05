@@ -1,7 +1,22 @@
-use std::ffi::OsStr;
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
+};
+use windows_sys::Win32::System::Console::{
+    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetNumberOfConsoleInputEvents,
+    GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleMode,
+};
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -116,7 +131,403 @@ fn scan_group(dir: &Path, period: i64) -> io::Result<Vec<LogEntry>> {
     Ok(latest_group(entries, period))
 }
 
-fn main() {}
+#[derive(Debug)]
+enum CliAction {
+    Run(Config),
+    Help,
+    Version,
+}
+
+fn parse_args<I, S>(args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let mut args = args.into_iter().map(|arg| arg.into());
+    let _program = args.next();
+    let mut config = Config {
+        filter: None,
+        case_sensitive: false,
+        ignore_blank_lines: false,
+        colored_log_level: true,
+        suppress_log_date: false,
+        watch_new_files: true,
+        group_period_secs: 30,
+    };
+    while let Some(argument) = args.next() {
+        let argument = argument
+            .into_string()
+            .map_err(|_| "arguments must be Unicode".to_owned())?;
+        match argument.as_str() {
+            "-h" | "--help" => return Ok(CliAction::Help),
+            "-V" | "--version" => return Ok(CliAction::Version),
+            "-f" | "--filter" => {
+                config.filter = Some(next_arg(&mut args, &argument)?);
+            }
+            "-c" | "--case-sensitive" => config.case_sensitive = true,
+            "-s" | "--ignore-blank-lines" => config.ignore_blank_lines = true,
+            "-L" | "--no-colored-log-level" => config.colored_log_level = false,
+            "-d" | "--suppress-log-date" => config.suppress_log_date = true,
+            "-g" | "--group-period" => {
+                let value = next_arg(&mut args, &argument)?;
+                config.group_period_secs = value
+                    .parse()
+                    .ok()
+                    .filter(|period: &i64| *period > 0)
+                    .ok_or_else(|| "group period must be a positive number".to_owned())?;
+            }
+            "--no-watch" => config.watch_new_files = false,
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    Ok(CliAction::Run(config))
+}
+
+fn next_arg<I>(args: &mut I, option: &str) -> Result<String, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    args.next()
+        .ok_or_else(|| format!("missing value for {option}"))?
+        .into_string()
+        .map_err(|_| "arguments must be Unicode".to_owned())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum InputAction {
+    Continue,
+    Quit,
+}
+
+#[derive(Default)]
+struct InputState {
+    entering_filter: bool,
+    text: String,
+    high_surrogate: Option<u16>,
+}
+
+impl InputState {
+    fn handle_utf16<W: Write>(
+        &mut self,
+        unit: u16,
+        config: &mut Config,
+        out: &mut W,
+    ) -> io::Result<InputAction> {
+        if let Some(high) = self.high_surrogate.take() {
+            let mut action = InputAction::Continue;
+            for decoded in char::decode_utf16([high, unit]) {
+                action =
+                    self.handle_char(decoded.unwrap_or(char::REPLACEMENT_CHARACTER), config, out)?;
+            }
+            Ok(action)
+        } else if (0xD800..=0xDBFF).contains(&unit) {
+            self.high_surrogate = Some(unit);
+            Ok(InputAction::Continue)
+        } else {
+            self.handle_char(
+                char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER),
+                config,
+                out,
+            )
+        }
+    }
+
+    fn handle_char<W: Write>(
+        &mut self,
+        character: char,
+        config: &mut Config,
+        out: &mut W,
+    ) -> io::Result<InputAction> {
+        if self.entering_filter {
+            if matches!(character, '\r' | '\n') {
+                self.entering_filter = false;
+                config.filter = Some(std::mem::take(&mut self.text));
+                writeln!(
+                    out,
+                    "\n> filter = {}",
+                    config.filter.as_deref().unwrap_or_default()
+                )?;
+            } else {
+                self.text.push(character);
+                write!(out, "{character}")?;
+            }
+            return Ok(InputAction::Continue);
+        }
+        match character {
+            '\u{3}' | 'q' => Ok(InputAction::Quit),
+            '?' => write_help(out).map(|()| InputAction::Continue),
+            '\r' | '\n' => writeln!(out).map(|()| InputAction::Continue),
+            'c' => {
+                config.case_sensitive = !config.case_sensitive;
+                writeln!(out, "> caseSensitive = {}", config.case_sensitive)?;
+                Ok(InputAction::Continue)
+            }
+            's' => {
+                config.ignore_blank_lines = !config.ignore_blank_lines;
+                writeln!(out, "> ignoreBlankLines = {}", config.ignore_blank_lines)?;
+                Ok(InputAction::Continue)
+            }
+            'l' => {
+                config.colored_log_level = !config.colored_log_level;
+                writeln!(out, "> coloredLogLevel = {}", config.colored_log_level)?;
+                Ok(InputAction::Continue)
+            }
+            'd' => {
+                config.suppress_log_date = !config.suppress_log_date;
+                writeln!(out, "> suppressLogDate = {}", config.suppress_log_date)?;
+                Ok(InputAction::Continue)
+            }
+            'r' => {
+                config.filter = None;
+                writeln!(out, "> filter cleared!")?;
+                Ok(InputAction::Continue)
+            }
+            '/' => {
+                self.entering_filter = true;
+                self.text.clear();
+                write!(out, "/")?;
+                Ok(InputAction::Continue)
+            }
+            _ => Ok(InputAction::Continue),
+        }
+    }
+}
+
+fn write_help<W: Write>(out: &mut W) -> io::Result<()> {
+    writeln!(out, "> Commands:")?;
+    writeln!(out, ">   ? - show this help")?;
+    writeln!(out, ">   q - quit")?;
+    writeln!(out, ">   c - toggle case sensitive")?;
+    writeln!(out, ">   s - toggle ignore blank lines")?;
+    writeln!(out, ">   l - toggle colored log level")?;
+    writeln!(out, ">   d - toggle supress log date")?;
+    writeln!(out, ">   /<str> - filter")?;
+    writeln!(out, ">   r - reset filter")
+}
+
+struct ChangeNotification(HANDLE);
+
+impl ChangeNotification {
+    fn new(dir: &Path) -> io::Result<Self> {
+        let path = dir
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            FindFirstChangeNotificationW(
+                path.as_ptr(),
+                0,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_SIZE
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn rearm(&self) -> io::Result<()> {
+        if unsafe { FindNextChangeNotification(self.0) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ChangeNotification {
+    fn drop(&mut self) {
+        // Change-notification handles have their own close API.
+        unsafe { FindCloseChangeNotification(self.0) };
+    }
+}
+
+struct ConsoleModes {
+    input: Option<(HANDLE, CONSOLE_MODE)>,
+    output: Option<(HANDLE, CONSOLE_MODE)>,
+    input_changed: bool,
+    output_changed: bool,
+}
+
+impl ConsoleModes {
+    fn new(input: HANDLE, output: HANDLE) -> io::Result<Self> {
+        let (input, input_changed) = set_console_mode(input, |mode| {
+            mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT)
+        })?;
+        let (output, output_changed) =
+            set_console_mode(output, |mode| mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
+        Ok(Self {
+            input,
+            output,
+            input_changed,
+            output_changed,
+        })
+    }
+}
+
+fn set_console_mode(
+    handle: HANDLE,
+    change: impl FnOnce(CONSOLE_MODE) -> CONSOLE_MODE,
+) -> io::Result<(Option<(HANDLE, CONSOLE_MODE)>, bool)> {
+    let mut mode = 0;
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return Ok((None, false));
+    }
+    let changed = change(mode);
+    if unsafe { SetConsoleMode(handle, changed) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((Some((handle, mode)), changed != mode))
+}
+
+impl Drop for ConsoleModes {
+    fn drop(&mut self) {
+        if self.input_changed
+            && let Some((handle, mode)) = self.input
+        {
+            unsafe { SetConsoleMode(handle, mode) };
+        }
+        if self.output_changed
+            && let Some((handle, mode)) = self.output
+        {
+            unsafe { SetConsoleMode(handle, mode) };
+        }
+    }
+}
+
+fn vrchat_log_dir() -> io::Result<PathBuf> {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("Low").join("VRChat").join("VRChat"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))
+}
+
+fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
+    let group = scan_group(dir, config.group_period_secs)?;
+    if group.is_empty() && !config.watch_new_files {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No log files found",
+        ));
+    }
+    let mut tails = TailSet::open_initial(group)?;
+    let notification = ChangeNotification::new(dir)?;
+    let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let modes = ConsoleModes::new(stdin, stdout)?;
+    let console_input = modes.input.map(|(handle, _)| handle);
+    let color_output = modes.output.is_some() && io::stdout().is_terminal();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let mut input = InputState::default();
+
+    loop {
+        let mut handles = vec![notification.0];
+        if let Some(handle) = console_input {
+            handles.push(handle);
+        }
+        let result =
+            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
+        if result == WAIT_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        if result == WAIT_OBJECT_0 {
+            notification.rearm()?;
+            if config.watch_new_files {
+                tails.reconcile(scan_group(dir, config.group_period_secs)?, &mut output)?;
+            } else {
+                tails.files.retain(|active| active.entry.path.exists());
+            }
+            tails.drain(&config, color_output, &mut output)?;
+            continue;
+        }
+        if result == WAIT_OBJECT_0 + 1 {
+            let Some(handle) = console_input else {
+                continue;
+            };
+            let mut count = 0;
+            if unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut records = [INPUT_RECORD::default(); 32];
+            while count != 0 {
+                let mut read = 0;
+                if unsafe {
+                    ReadConsoleInputW(
+                        handle,
+                        records.as_mut_ptr(),
+                        records.len() as u32,
+                        &mut read,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                for record in &records[..read as usize] {
+                    if record.EventType != KEY_EVENT as u16 {
+                        continue;
+                    }
+                    let key = unsafe { record.Event.KeyEvent };
+                    if key.bKeyDown == 0 {
+                        continue;
+                    }
+                    let unit = unsafe { key.uChar.UnicodeChar };
+                    for _ in 0..key.wRepeatCount {
+                        if input.handle_utf16(unit, &mut config, &mut output)? == InputAction::Quit
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+                if unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let result = match parse_args(env::args_os()) {
+        Ok(CliAction::Help) => print_help(&mut io::stdout()),
+        Ok(CliAction::Version) => {
+            writeln!(io::stdout(), "{}", env!("CARGO_PKG_VERSION"))
+        }
+        Ok(CliAction::Run(config)) => vrchat_log_dir().and_then(|dir| run_in_dir(config, &dir)),
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("vrc-tail: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
+    writeln!(out, "Usage: vrc-tail [OPTIONS]")?;
+    writeln!(out, "  -f, --filter <str>          filter")?;
+    writeln!(out, "  -c, --case-sensitive         case sensitive")?;
+    writeln!(out, "  -s, --ignore-blank-lines     ignore blank lines")?;
+    writeln!(out, "  -L, --no-colored-log-level   no colored log level")?;
+    writeln!(out, "  -d, --suppress-log-date      suppress log date")?;
+    writeln!(
+        out,
+        "  -g, --group-period <sec>     log group period (seconds)"
+    )?;
+    writeln!(
+        out,
+        "      --no-watch               do not add new log files"
+    )?;
+    writeln!(out, "  -h, --help                   print help")?;
+    writeln!(out, "  -V, --version                print version")
+}
 
 #[allow(dead_code)]
 struct ActiveFile {
@@ -526,6 +937,156 @@ mod tests {
             watch_new_files: false,
             group_period_secs: 0,
         }
+    }
+
+    #[test]
+    fn parses_cli_flags_and_defaults() {
+        let CliAction::Run(defaults) = parse_args(["vrc-tail"]).unwrap() else {
+            panic!();
+        };
+        assert_eq!(defaults.group_period_secs, 30);
+        assert!(defaults.watch_new_files);
+        assert!(defaults.colored_log_level);
+
+        let CliAction::Run(config) = parse_args([
+            "vrc-tail",
+            "-f",
+            "Error",
+            "-c",
+            "-s",
+            "-L",
+            "-d",
+            "-g",
+            "12",
+            "--no-watch",
+        ])
+        .unwrap() else {
+            panic!();
+        };
+        assert_eq!(config.filter.as_deref(), Some("Error"));
+        assert!(config.case_sensitive && config.ignore_blank_lines && config.suppress_log_date);
+        assert!(!config.colored_log_level && !config.watch_new_files);
+        assert_eq!(config.group_period_secs, 12);
+
+        let CliAction::Run(config) = parse_args([
+            "vrc-tail",
+            "--filter",
+            "Warn",
+            "--case-sensitive",
+            "--ignore-blank-lines",
+            "--no-colored-log-level",
+            "--suppress-log-date",
+            "--group-period",
+            "9",
+            "--no-watch",
+        ])
+        .unwrap() else {
+            panic!();
+        };
+        assert_eq!(config.filter.as_deref(), Some("Warn"));
+        assert!(config.case_sensitive && config.ignore_blank_lines && config.suppress_log_date);
+        assert!(!config.colored_log_level && !config.watch_new_files);
+        assert_eq!(config.group_period_secs, 9);
+    }
+
+    #[test]
+    fn rejects_invalid_cli_arguments_and_recognizes_meta_actions() {
+        for args in [
+            vec!["vrc-tail", "-f"],
+            vec!["vrc-tail", "--filter"],
+            vec!["vrc-tail", "-g"],
+            vec!["vrc-tail", "-g", "0"],
+            vec!["vrc-tail", "--group-period", "-1"],
+            vec!["vrc-tail", "--group-period", "no"],
+            vec!["vrc-tail", "--unknown"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
+        assert!(matches!(
+            parse_args(["vrc-tail", "-h"]),
+            Ok(CliAction::Help)
+        ));
+        assert!(matches!(
+            parse_args(["vrc-tail", "--help"]),
+            Ok(CliAction::Help)
+        ));
+        assert!(matches!(
+            parse_args(["vrc-tail", "--version"]),
+            Ok(CliAction::Version)
+        ));
+        assert!(matches!(
+            parse_args(["vrc-tail", "-V"]),
+            Ok(CliAction::Version)
+        ));
+    }
+
+    #[test]
+    fn initial_filter_respects_case_sensitivity() {
+        let CliAction::Run(config) = parse_args(["vrc-tail", "-f", "Error", "-c"]).unwrap() else {
+            panic!();
+        };
+        assert!(line_matches("Error", &config));
+        assert!(!line_matches("error", &config));
+    }
+
+    #[test]
+    fn console_input_filters_toggles_and_quits() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = Vec::new();
+        assert_eq!(
+            state
+                .handle_utf16('/' as u16, &mut config, &mut output)
+                .unwrap(),
+            InputAction::Continue
+        );
+        for unit in "日本😀".encode_utf16() {
+            state.handle_utf16(unit, &mut config, &mut output).unwrap();
+        }
+        state
+            .handle_utf16('\r' as u16, &mut config, &mut output)
+            .unwrap();
+        assert_eq!(config.filter.as_deref(), Some("日本😀"));
+        state
+            .handle_utf16('/' as u16, &mut config, &mut output)
+            .unwrap();
+        for unit in "Error".encode_utf16() {
+            state.handle_utf16(unit, &mut config, &mut output).unwrap();
+        }
+        state
+            .handle_utf16('\r' as u16, &mut config, &mut output)
+            .unwrap();
+        assert!(line_matches("error", &config));
+        state
+            .handle_utf16('c' as u16, &mut config, &mut output)
+            .unwrap();
+        assert!(config.case_sensitive);
+        assert!(!line_matches("error", &config));
+        for command in ['?', 's', 'l', 'd'] {
+            state
+                .handle_utf16(command as u16, &mut config, &mut output)
+                .unwrap();
+        }
+        assert!(config.ignore_blank_lines && !config.colored_log_level && config.suppress_log_date);
+        state
+            .handle_utf16('r' as u16, &mut config, &mut output)
+            .unwrap();
+        assert!(config.filter.is_none());
+        assert_eq!(
+            state.handle_utf16(3, &mut config, &mut output).unwrap(),
+            InputAction::Quit
+        );
+        assert_eq!(
+            state
+                .handle_utf16('q' as u16, &mut config, &mut output)
+                .unwrap(),
+            InputAction::Quit
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("> filter = 日本😀")
+        );
     }
 
     #[test]
