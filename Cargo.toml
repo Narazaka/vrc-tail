@@ -1,0 +1,22 @@
+[package]
+name = "vrc-tail"
+version = "1.4.3"
+edition = "2024"
+description = "tail -f for VRChat logs"
+license = "Zlib"
+
+[dependencies]
+windows-sys = { version = "0.61.2", default-features = false, features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
