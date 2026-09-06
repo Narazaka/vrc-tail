@@ -1,9 +1,9 @@
 pub(crate) const DEFAULT_GROUP_PERIOD_SECS: i64 = 30;
 
 #[derive(clap::Parser)]
-#[command(version, about)]
+#[command(version, about, args_override_self = true)]
 pub(crate) struct Cli {
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     filter: Option<String>,
     #[arg(short, long)]
     case_sensitive: bool,
@@ -166,6 +166,34 @@ mod tests {
         assert!(config.suppress_log_date);
         assert!(!config.watch_new_files);
         assert_eq!(config.group_period_secs, 9);
+    }
+
+    #[test]
+    fn repeated_value_options_use_the_last_value() {
+        let config = Config::from(
+            Cli::try_parse_from([
+                "vrc-tail",
+                "--filter",
+                "first",
+                "--filter",
+                "last",
+                "--group-period",
+                "10",
+                "--group-period",
+                "20",
+            ])
+            .unwrap(),
+        );
+
+        assert_eq!(config.filter_text(), Some("last"));
+        assert_eq!(config.group_period_secs, 20);
+    }
+
+    #[test]
+    fn filter_value_may_start_with_a_hyphen() {
+        let config = Config::from(Cli::try_parse_from(["vrc-tail", "--filter", "-foo"]).unwrap());
+
+        assert_eq!(config.filter_text(), Some("-foo"));
     }
 
     #[test]

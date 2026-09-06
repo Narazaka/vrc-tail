@@ -34,8 +34,8 @@ fn parse_log_name(name: &OsStr, path: PathBuf) -> Option<LogEntry> {
 pub(crate) fn latest_group(mut entries: Vec<LogEntry>, period: i64) -> Vec<LogEntry> {
     entries.sort_by_key(|entry| entry.time);
     if let Some(newest) = entries.last().map(|entry| entry.time) {
-        let cutoff = newest
-            .checked_sub_signed(TimeDelta::seconds(period))
+        let cutoff = TimeDelta::try_seconds(period)
+            .and_then(|delta| newest.checked_sub_signed(delta))
             .unwrap_or(NaiveDateTime::MIN);
         entries.retain(|entry| entry.time >= cutoff);
     }
@@ -126,6 +126,18 @@ mod tests {
         let entries = vec![entry("12-01-00"), entry("12-00-00")];
 
         let group = latest_group(entries, 60);
+
+        assert_eq!(
+            group.iter().map(|entry| entry.time).collect::<Vec<_>>(),
+            vec![timestamp(12, 0, 0), timestamp(12, 1, 0)]
+        );
+    }
+
+    #[test]
+    fn maximum_period_keeps_all_entries_without_panicking() {
+        let entries = vec![entry("12-01-00"), entry("12-00-00")];
+
+        let group = latest_group(entries, i64::MAX);
 
         assert_eq!(
             group.iter().map(|entry| entry.time).collect::<Vec<_>>(),
