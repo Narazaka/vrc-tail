@@ -1,6 +1,6 @@
 [package]
 name = "vrc-tail"
-version = "1.4.3"
+version = "1.5.0"
 edition = "2024"
 description = "tail -f for VRChat logs"
 license = "Zlib"
