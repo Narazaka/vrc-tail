@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -436,7 +436,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
             "No log files found",
         ));
     }
-    let fixed_group = (!config.watch_new_files).then(|| group.clone());
+    let mut fixed_group = (!config.watch_new_files).then(|| group.clone());
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let modes = ConsoleModes::new(stdin, stdout)?;
@@ -462,8 +462,8 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
             notification.rearm()?;
             if config.watch_new_files {
                 tails.reconcile(scan_group(dir, config.group_period_secs)?, &mut output)?;
-            } else {
-                tails.reconcile(fixed_group.clone().unwrap_or_default(), &mut output)?;
+            } else if let Some(group) = fixed_group.as_mut() {
+                tails.reconcile_fixed(group, &mut output)?;
             }
             tails.drain(&config, color_output, &mut output)?;
             continue;
@@ -564,6 +564,7 @@ struct ActiveFile {
 #[allow(dead_code)]
 struct TailSet {
     files: Vec<ActiveFile>,
+    startup_pending: Vec<LogEntry>,
     read_buffer: Box<[u8; 16 * 1024]>,
 }
 
@@ -571,6 +572,7 @@ impl Default for TailSet {
     fn default() -> Self {
         Self {
             files: Vec::new(),
+            startup_pending: Vec::new(),
             read_buffer: Box::new([0; 16 * 1024]),
         }
     }
@@ -592,11 +594,13 @@ impl TailSet {
                         pending: Vec::new(),
                     }),
                     Err(error) => {
-                        writeln!(warnings, "failed to seek {}: {error}", entry.path.display())?
+                        writeln!(warnings, "failed to seek {}: {error}", entry.path.display())?;
+                        tails.startup_pending.push(entry);
                     }
                 },
                 Err(error) => {
-                    writeln!(warnings, "failed to open {}: {error}", entry.path.display())?
+                    writeln!(warnings, "failed to open {}: {error}", entry.path.display())?;
+                    tails.startup_pending.push(entry);
                 }
             }
         }
@@ -609,16 +613,25 @@ impl TailSet {
         warnings: &mut W,
     ) -> io::Result<()> {
         group.sort_by_key(|entry| entry.time);
-        let reset = !self.files.is_empty()
+        let reset = !group.is_empty()
+            && (!self.files.is_empty() || !self.startup_pending.is_empty())
             && !group.iter().any(|entry| {
                 self.files
                     .iter()
                     .any(|active| active.entry.path == entry.path)
+                    || self
+                        .startup_pending
+                        .iter()
+                        .any(|pending| pending.path == entry.path)
             });
         if reset {
             self.files.clear();
+            self.startup_pending.clear();
             writeln!(warnings, "{}", "-".repeat(79))?;
         }
+
+        self.startup_pending
+            .retain(|pending| group.iter().any(|entry| entry.path == pending.path));
 
         let mut previous = std::mem::take(&mut self.files);
         for (index, entry) in group.into_iter().enumerate() {
@@ -632,20 +645,68 @@ impl TailSet {
                 self.files.push(active);
                 continue;
             }
+            let startup_position = self
+                .startup_pending
+                .iter()
+                .position(|pending| pending.path == entry.path);
             match File::open(&entry.path) {
-                Ok(file) => self.files.push(ActiveFile {
-                    entry,
-                    index,
-                    file,
-                    offset: 0,
-                    pending: Vec::new(),
-                }),
+                Ok(mut file) => {
+                    let offset = if startup_position.is_some() {
+                        match file.seek(SeekFrom::End(0)) {
+                            Ok(offset) => offset,
+                            Err(error) => {
+                                writeln!(
+                                    warnings,
+                                    "failed to seek {}: {error}",
+                                    entry.path.display()
+                                )?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    if let Some(position) = startup_position {
+                        self.startup_pending.remove(position);
+                    }
+                    self.files.push(ActiveFile {
+                        entry,
+                        index,
+                        file,
+                        offset,
+                        pending: Vec::new(),
+                    });
+                }
                 Err(error) => {
                     writeln!(warnings, "failed to open {}: {error}", entry.path.display())?
                 }
             }
         }
         Ok(())
+    }
+
+    fn reconcile_fixed<W: Write>(
+        &mut self,
+        group: &mut Vec<LogEntry>,
+        warnings: &mut W,
+    ) -> io::Result<()> {
+        let mut warning_result = Ok(());
+        group.retain(|entry| match fs::metadata(&entry.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                if warning_result.is_ok() {
+                    warning_result = writeln!(
+                        warnings,
+                        "failed to read metadata for {}: {error}",
+                        entry.path.display()
+                    );
+                }
+                true
+            }
+            Ok(_) => true,
+        });
+        warning_result?;
+        self.reconcile(group.clone(), warnings)
     }
 
     fn drain<W: Write>(
@@ -889,6 +950,7 @@ fn write_line<W: Write>(
 mod tests {
     use super::*;
     use std::fs::{self, OpenOptions};
+    use std::os::windows::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[derive(Default)]
@@ -1413,6 +1475,65 @@ mod tests {
         fs::write(&missing.path, "recovered\n").unwrap();
         tails.reconcile(group, &mut warnings).unwrap();
         assert_eq!(tails.files.len(), 2);
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn recovered_startup_file_starts_at_eof() {
+        let dir = test_dir("startup-eof-recovery");
+        let entry = test_log(&dir, 0);
+        fs::write(&entry.path, "before startup\n").unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&entry.path)
+            .unwrap();
+        let mut warnings = Vec::new();
+        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut warnings).unwrap();
+        assert!(tails.files.is_empty());
+        drop(lock);
+
+        tails.reconcile(vec![entry.clone()], &mut warnings).unwrap();
+        let mut output = Vec::new();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        assert!(output.is_empty());
+
+        fs::write(&entry.path, "before startup\nafter startup\n").unwrap();
+        tails
+            .drain(&config(None, true, false, false), false, &mut output)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("before startup"));
+        assert!(output.contains("after startup"));
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn fixed_selection_drops_deleted_files_and_startup_state() {
+        let dir = test_dir("fixed-deletion");
+        let active = test_log(&dir, 0);
+        let pending = test_log(&dir, 1);
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&pending.path)
+            .unwrap();
+        let mut group = vec![active.clone(), pending.clone()];
+        let mut warnings = Vec::new();
+        let mut tails = TailSet::open_initial(group.clone(), &mut warnings).unwrap();
+        assert_eq!(tails.files.len(), 1);
+        drop(lock);
+
+        fs::remove_file(&active.path).unwrap();
+        fs::remove_file(&pending.path).unwrap();
+        tails.reconcile_fixed(&mut group, &mut warnings).unwrap();
+        assert!(group.is_empty());
+        assert!(tails.files.is_empty());
+
+        fs::write(&pending.path, "new generation\n").unwrap();
+        tails.reconcile(vec![pending], &mut warnings).unwrap();
         let mut output = Vec::new();
         tails
             .drain(&config(None, true, false, false), false, &mut output)
@@ -1420,9 +1541,23 @@ mod tests {
         assert!(
             String::from_utf8(output)
                 .unwrap()
-                .contains(" [0] recovered\n")
+                .contains("new generation")
         );
         remove_test_dir(dir);
+    }
+
+    #[test]
+    fn fixed_selection_keeps_unconfirmed_metadata_errors() {
+        let mut group = vec![LogEntry {
+            path: PathBuf::from(OsString::from("invalid\0path")),
+            time: 0,
+        }];
+        let mut warnings = Vec::new();
+        TailSet::default()
+            .reconcile_fixed(&mut group, &mut warnings)
+            .unwrap();
+        assert_eq!(group.len(), 1);
+        assert!(String::from_utf8_lossy(&warnings).contains("failed to read metadata"));
     }
 
     #[test]
