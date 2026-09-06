@@ -199,7 +199,7 @@ where
         .map_err(|_| "arguments must be Unicode".to_owned())
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum InputAction {
     Continue,
     Quit,
