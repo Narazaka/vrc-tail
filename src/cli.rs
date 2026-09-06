@@ -80,6 +80,23 @@ impl From<Cli> for Config {
 }
 
 #[cfg(test)]
+pub(crate) fn test_config(
+    filter: Option<&str>,
+    case_sensitive: bool,
+    ignore_blank_lines: bool,
+    suppress_log_date: bool,
+) -> Config {
+    use clap::Parser;
+
+    let mut config = Config::from(Cli::try_parse_from(["vrc-tail", "--no-watch"]).unwrap());
+    config.case_sensitive = case_sensitive;
+    config.ignore_blank_lines = ignore_blank_lines;
+    config.suppress_log_date = suppress_log_date;
+    config.set_filter(filter.map(str::to_owned));
+    config
+}
+
+#[cfg(test)]
 mod tests {
     use super::{Cli, Config};
     use clap::{Parser, error::ErrorKind};

@@ -96,3 +96,120 @@ fn write_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(out, ">   /<str> - filter")?;
     writeln!(out, ">   r - reset filter")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::test_config as config;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn plain_q_quits_only_outside_filter_entry() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = Vec::new();
+        assert_eq!(
+            state
+                .handle_key(key(KeyCode::Char('q')), &mut config, &mut output)
+                .unwrap(),
+            InputAction::Quit
+        );
+        state
+            .handle_key(key(KeyCode::Char('/')), &mut config, &mut output)
+            .unwrap();
+        assert_eq!(
+            state
+                .handle_key(key(KeyCode::Char('q')), &mut config, &mut output)
+                .unwrap(),
+            InputAction::Continue
+        );
+        state
+            .handle_key(key(KeyCode::Enter), &mut config, &mut output)
+            .unwrap();
+        assert_eq!(config.filter_text(), Some("q"));
+    }
+
+    #[test]
+    fn control_c_always_quits() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = Vec::new();
+        state
+            .handle_key(key(KeyCode::Char('/')), &mut config, &mut output)
+            .unwrap();
+        assert_eq!(
+            state
+                .handle_key(
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &mut config,
+                    &mut output,
+                )
+                .unwrap(),
+            InputAction::Quit
+        );
+    }
+
+    #[test]
+    fn enter_installs_unicode_filter() {
+        let mut state = InputState::default();
+        let mut config = config(None, false, false, false);
+        let mut output = Vec::new();
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('日'),
+            KeyCode::Char('本'),
+            KeyCode::Char('😀'),
+            KeyCode::Enter,
+        ] {
+            state
+                .handle_key(key(code), &mut config, &mut output)
+                .unwrap();
+        }
+        assert_eq!(config.filter_text(), Some("日本😀"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("> filter = 日本😀")
+        );
+    }
+
+    #[test]
+    fn interactive_commands_retain_their_effects() {
+        let mut state = InputState::default();
+        let mut config = config(Some("Error"), false, false, false);
+        let mut output = Vec::new();
+        for command in ['?', 'c', 's', 'l', 'd', 'r'] {
+            state
+                .handle_key(key(KeyCode::Char(command)), &mut config, &mut output)
+                .unwrap();
+        }
+        assert!(config.case_sensitive);
+        assert!(config.ignore_blank_lines);
+        assert!(!config.colored_log_level);
+        assert!(config.suppress_log_date);
+        assert_eq!(config.filter_text(), None);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("> Commands:"));
+        assert!(output.contains("suppress log date"));
+    }
+
+    #[test]
+    fn non_character_keys_do_nothing() {
+        let mut state = InputState::default();
+        let mut config = config(Some("keep"), false, false, false);
+        let mut output = Vec::new();
+        for code in [KeyCode::Backspace, KeyCode::Left, KeyCode::F(1)] {
+            assert_eq!(
+                state
+                    .handle_key(key(code), &mut config, &mut output)
+                    .unwrap(),
+                InputAction::Continue
+            );
+        }
+        assert_eq!(config.filter_text(), Some("keep"));
+        assert!(output.is_empty());
+    }
+}
