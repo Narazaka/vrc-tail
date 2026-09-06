@@ -18,10 +18,16 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
+const DEFAULT_GROUP_PERIOD_SECS: i64 = 30;
+const READ_BUFFER_SIZE: usize = 16 * 1024;
+const RETAINED_PENDING_BUFFER_SIZE: usize = 4 * 1024;
+const LOG_DATE_PREFIX_LEN: usize = 20;
+const SEPARATOR_WIDTH: usize = 79;
+const LEGACY_FILE_COLORS: [usize; 6] = [32, 34, 35, 36, 37, 90];
+
 struct Config {
     filter: Option<String>,
+    normalized_filter: Option<String>,
     case_sensitive: bool,
     ignore_blank_lines: bool,
     colored_log_level: bool,
@@ -30,7 +36,14 @@ struct Config {
     group_period_secs: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl Config {
+    fn set_filter(&mut self, filter: Option<String>) {
+        self.normalized_filter = filter.as_ref().map(|value| value.to_lowercase());
+        self.filter = filter;
+    }
+}
+
+#[derive(Clone)]
 struct LogEntry {
     path: PathBuf,
     time: i64,
@@ -40,35 +53,28 @@ fn parse_log_name(name: &OsStr, path: PathBuf) -> Option<LogEntry> {
     let name = name.to_str()?;
     let value = name.strip_prefix("output_log_")?.strip_suffix(".txt")?;
     let bytes = value.as_bytes();
-    if bytes.len() != 19
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'_'
-        || bytes[13] != b'-'
-        || bytes[16] != b'-'
-        || bytes
-            .iter()
-            .enumerate()
-            .any(|(index, byte)| !matches!(index, 4 | 7 | 10 | 13 | 16) && !byte.is_ascii_digit())
+    let format = b"0000-00-00_00-00-00";
+    if bytes.len() != format.len()
+        || bytes.iter().zip(format).any(|(actual, expected)| {
+            if expected.is_ascii_digit() {
+                !actual.is_ascii_digit()
+            } else {
+                actual != expected
+            }
+        })
     {
         return None;
     }
-    let [year, month, day, hour, minute, second] = [
-        &value[0..4],
-        &value[5..7],
-        &value[8..10],
-        &value[11..13],
-        &value[14..16],
-        &value[17..19],
-    ]
-    .map(|field| field.parse().ok())
-    .into_iter()
-    .collect::<Option<Vec<u32>>>()?
-    .try_into()
-    .ok()?;
+    let mut fields = value.split(['-', '_']);
+    let year = fields.next()?.parse::<i64>().ok()?;
+    let month = fields.next()?.parse().ok()?;
+    let day = fields.next()?.parse().ok()?;
+    let hour = fields.next()?.parse().ok()?;
+    let minute = fields.next()?.parse().ok()?;
+    let second = fields.next()?.parse().ok()?;
     Some(LogEntry {
         path,
-        time: civil_seconds(year.into(), month, day, hour, minute, second)?,
+        time: civil_seconds(year, month, day, hour, minute, second)?,
     })
 }
 
@@ -106,8 +112,9 @@ fn civil_seconds(
     let year_of_era = adjusted_year - era * 400;
     let month = i64::from(month);
     let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    // A naive civil timestamp is sufficient because log names have no timezone and are compared only with each other.
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146097 + day_of_era - 719468;
+    let days = era * 146_097 + day_of_era - 719_468;
     Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
 }
 
@@ -119,7 +126,6 @@ fn latest_group(mut entries: Vec<LogEntry>, period: i64) -> Vec<LogEntry> {
     entries
 }
 
-#[allow(dead_code)]
 fn scan_group(dir: &Path, period: i64) -> io::Result<Vec<LogEntry>> {
     let mut entries = Vec::new();
     for item in dir.read_dir()? {
@@ -131,7 +137,6 @@ fn scan_group(dir: &Path, period: i64) -> io::Result<Vec<LogEntry>> {
     Ok(latest_group(entries, period))
 }
 
-#[derive(Debug)]
 enum CliAction {
     Run(Config),
     Help,
@@ -143,16 +148,17 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let mut args = args.into_iter().map(|arg| arg.into());
-    let _program = args.next();
+    let mut args = args.into_iter().map(Into::into);
+    args.next();
     let mut config = Config {
         filter: None,
+        normalized_filter: None,
         case_sensitive: false,
         ignore_blank_lines: false,
         colored_log_level: true,
         suppress_log_date: false,
         watch_new_files: true,
-        group_period_secs: 30,
+        group_period_secs: DEFAULT_GROUP_PERIOD_SECS,
     };
     while let Some(argument) = args.next() {
         let argument = argument
@@ -162,7 +168,7 @@ where
             "-h" | "--help" => return Ok(CliAction::Help),
             "-V" | "--version" => return Ok(CliAction::Version),
             "-f" | "--filter" => {
-                config.filter = Some(next_arg(&mut args, &argument)?);
+                config.set_filter(Some(next_arg(&mut args, &argument)?));
             }
             "-c" | "--case-sensitive" => config.case_sensitive = true,
             "-s" | "--ignore-blank-lines" => config.ignore_blank_lines = true,
@@ -246,7 +252,7 @@ impl InputState {
         if self.entering_filter {
             if matches!(character, '\r' | '\n') {
                 self.entering_filter = false;
-                config.filter = Some(std::mem::take(&mut self.text));
+                config.set_filter(Some(std::mem::take(&mut self.text)));
                 writeln!(
                     out,
                     "\n> filter = {}",
@@ -283,7 +289,7 @@ impl InputState {
                 Ok(InputAction::Continue)
             }
             'r' => {
-                config.filter = None;
+                config.set_filter(None);
                 writeln!(out, "> filter cleared!")?;
                 Ok(InputAction::Continue)
             }
@@ -305,7 +311,7 @@ fn write_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(out, ">   c - toggle case sensitive")?;
     writeln!(out, ">   s - toggle ignore blank lines")?;
     writeln!(out, ">   l - toggle colored log level")?;
-    writeln!(out, ">   d - toggle supress log date")?;
+    writeln!(out, ">   d - toggle suppress log date")?;
     writeln!(out, ">   /<str> - filter")?;
     writeln!(out, ">   r - reset filter")
 }
@@ -423,10 +429,6 @@ fn vrchat_log_dir_from_local_app_data(path: &Path) -> io::Result<PathBuf> {
     Ok(path.with_file_name(name).join("VRChat").join("VRChat"))
 }
 
-fn flush_before_wait<W: Write>(out: &mut W) -> io::Result<()> {
-    out.flush()
-}
-
 fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
     let notification = ChangeNotification::new(dir)?;
     let group = scan_group(dir, config.group_period_secs)?;
@@ -438,9 +440,13 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
     }
     let mut fixed_group = (!config.watch_new_files).then(|| group.clone());
     let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    let modes = ConsoleModes::new(stdin, stdout)?;
+    let console_output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let modes = ConsoleModes::new(stdin, console_output)?;
     let console_input = modes.input.map(|(handle, _)| handle);
+    let mut handles = vec![notification.0];
+    if let Some(handle) = console_input {
+        handles.push(handle);
+    }
     let color_output = modes.output.is_some() && io::stdout().is_terminal();
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -448,11 +454,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
     let mut input = InputState::default();
 
     loop {
-        let mut handles = vec![notification.0];
-        if let Some(handle) = console_input {
-            handles.push(handle);
-        }
-        flush_before_wait(&mut output)?;
+        output.flush()?;
         let result =
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
         if result == WAIT_FAILED {
@@ -552,7 +554,6 @@ fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
     writeln!(out, "  -V, --version                print version")
 }
 
-#[allow(dead_code)]
 struct ActiveFile {
     entry: LogEntry,
     index: usize,
@@ -561,12 +562,11 @@ struct ActiveFile {
     pending: Vec<u8>,
 }
 
-#[allow(dead_code)]
 struct TailSet {
     files: Vec<ActiveFile>,
     startup_pending: Vec<LogEntry>,
     separator_pending: bool,
-    read_buffer: Box<[u8; 16 * 1024]>,
+    read_buffer: Box<[u8; READ_BUFFER_SIZE]>,
 }
 
 impl Default for TailSet {
@@ -575,12 +575,11 @@ impl Default for TailSet {
             files: Vec::new(),
             startup_pending: Vec::new(),
             separator_pending: false,
-            read_buffer: Box::new([0; 16 * 1024]),
+            read_buffer: Box::new([0; READ_BUFFER_SIZE]),
         }
     }
 }
 
-#[allow(dead_code)]
 impl TailSet {
     fn open_initial<W: Write>(mut group: Vec<LogEntry>, warnings: &mut W) -> io::Result<Self> {
         group.sort_by_key(|entry| entry.time);
@@ -615,26 +614,26 @@ impl TailSet {
         warnings: &mut W,
     ) -> io::Result<()> {
         group.sort_by_key(|entry| entry.time);
-        if group.is_empty() && (!self.files.is_empty() || !self.startup_pending.is_empty()) {
+        let has_state = !self.files.is_empty() || !self.startup_pending.is_empty();
+        if group.is_empty() && has_state {
             self.separator_pending = true;
         }
-        let reset = !group.is_empty()
-            && (self.separator_pending
-                || ((!self.files.is_empty() || !self.startup_pending.is_empty())
-                    && !group.iter().any(|entry| {
-                        self.files
-                            .iter()
-                            .any(|active| active.entry.path == entry.path)
-                            || self
-                                .startup_pending
-                                .iter()
-                                .any(|pending| pending.path == entry.path)
-                    })));
+        let group_overlaps_state = group.iter().any(|entry| {
+            self.files
+                .iter()
+                .any(|active| active.entry.path == entry.path)
+                || self
+                    .startup_pending
+                    .iter()
+                    .any(|pending| pending.path == entry.path)
+        });
+        let reset =
+            !group.is_empty() && (self.separator_pending || (has_state && !group_overlaps_state));
         if reset {
             self.files.clear();
             self.startup_pending.clear();
             self.separator_pending = false;
-            writeln!(warnings, "{}", "-".repeat(79))?;
+            writeln!(warnings, "{}", "-".repeat(SEPARATOR_WIDTH))?;
         }
 
         self.startup_pending
@@ -786,7 +785,6 @@ impl TailSet {
     }
 }
 
-#[allow(dead_code)]
 fn consume_lines<E>(
     pending: &mut Vec<u8>,
     bytes: &[u8],
@@ -807,14 +805,15 @@ fn consume_lines<E>(
     }
     if consumed != 0 {
         pending.drain(..consumed);
-        if pending.capacity() > 4 * 1024 && pending.len() < 4 * 1024 {
-            pending.shrink_to(4 * 1024);
+        if pending.capacity() > RETAINED_PENDING_BUFFER_SIZE
+            && pending.len() < RETAINED_PENDING_BUFFER_SIZE
+        {
+            pending.shrink_to(RETAINED_PENDING_BUFFER_SIZE);
         }
     }
     Ok(())
 }
 
-#[allow(dead_code)]
 fn line_matches(line: &str, config: &Config) -> bool {
     let Some(filter) = config.filter.as_deref() else {
         return true;
@@ -822,47 +821,31 @@ fn line_matches(line: &str, config: &Config) -> bool {
     if config.case_sensitive {
         line.contains(filter)
     } else {
-        let lowered = line.to_lowercase();
-        if filter.is_empty() {
-            return true;
-        }
-        lowered.char_indices().any(|(start, _)| {
-            let mut candidate = lowered[start..].chars();
-            let mut needle = filter.chars().flat_map(char::to_lowercase);
-            loop {
-                match (needle.next(), candidate.next()) {
-                    (None, _) => return true,
-                    (Some(expected), Some(actual)) if expected == actual => {}
-                    _ => return false,
-                }
-            }
-        })
+        let filter = config.normalized_filter.as_deref().unwrap_or_default();
+        filter.is_empty() || line.to_lowercase().contains(filter)
     }
 }
 
-#[allow(dead_code)]
 fn strip_log_date(line: &str) -> &str {
     if has_log_date_prefix(line) {
-        &line[20..]
+        &line[LOG_DATE_PREFIX_LEN..]
     } else {
         line
     }
 }
 
-#[allow(dead_code)]
 fn log_level(line: &str) -> Option<(&str, &str)> {
     if !has_log_date_prefix(line) {
         return None;
     }
-    let rest = &line[20..];
+    let rest = &line[LOG_DATE_PREFIX_LEN..];
     ["Warning", "Exception", "Error", "Log"]
         .iter()
         .find_map(|level| rest.strip_prefix(level).map(|suffix| (*level, suffix)))
 }
 
-#[allow(dead_code)]
 fn has_log_date_prefix(line: &str) -> bool {
-    line.len() >= 20
+    line.len() >= LOG_DATE_PREFIX_LEN
         && line.as_bytes()[4] == b'.'
         && line.as_bytes()[7] == b'.'
         && line.as_bytes()[10] == b' '
@@ -875,7 +858,6 @@ fn has_log_date_prefix(line: &str) -> bool {
             .all(|(i, byte)| matches!(i, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
 }
 
-#[allow(dead_code)]
 fn formatted_timestamp() -> String {
     let mut now = windows_sys::Win32::Foundation::SYSTEMTIME {
         wYear: 0,
@@ -894,7 +876,6 @@ fn formatted_timestamp() -> String {
     )
 }
 
-#[allow(dead_code)]
 fn write_line<W: Write>(
     out: &mut W,
     line: &str,
@@ -908,7 +889,7 @@ fn write_line<W: Write>(
     }
     let prefix = format!("{timestamp} [{index}] ");
     if color_output {
-        let index_code = [32, 34, 35, 36, 37, 90][index % 6];
+        let index_code = LEGACY_FILE_COLORS[index % LEGACY_FILE_COLORS.len()];
         if config.colored_log_level
             && let Some((level, suffix)) = log_level(line)
         {
@@ -925,7 +906,7 @@ fn write_line<W: Write>(
                 if config.suppress_log_date {
                     level
                 } else {
-                    &line[0..20 + level.len()]
+                    &line[..LOG_DATE_PREFIX_LEN + level.len()]
                 },
                 suffix
             )?;
@@ -954,809 +935,4 @@ fn write_line<W: Write>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::{self, OpenOptions};
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    #[derive(Default)]
-    struct FlushWriter {
-        bytes: Vec<u8>,
-        flushed: bool,
-        fail_flush: bool,
-    }
-
-    impl Write for FlushWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            if self.fail_flush {
-                return Err(io::Error::other("flush failed"));
-            }
-            self.flushed = true;
-            Ok(())
-        }
-    }
-
-    fn test_dir(suffix: &str) -> PathBuf {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().canonicalize().unwrap();
-        loop {
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let dir = root.join(format!(
-                "vrc-tail-test-{}-{suffix}-{id}",
-                std::process::id()
-            ));
-            match fs::create_dir(&dir) {
-                Ok(()) => return dir,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("failed to create {}: {error}", dir.display()),
-            }
-        }
-    }
-
-    fn remove_test_dir(dir: PathBuf) {
-        let root = std::env::temp_dir().canonicalize().unwrap();
-        assert!(dir.canonicalize().unwrap().starts_with(root));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn test_log(dir: &Path, index: usize) -> LogEntry {
-        let path = dir.join(format!("output_log_2026-09-05_12-00-{index:02}.txt"));
-        fs::write(&path, []).unwrap();
-        LogEntry {
-            path,
-            time: index as i64,
-        }
-    }
-
-    fn seconds(hour: u32, minute: u32, second: u32) -> i64 {
-        civil_seconds(2026, 9, 5, hour, minute, second).unwrap()
-    }
-
-    fn entry(time: &str) -> LogEntry {
-        let name = format!("output_log_2026-09-05_{time}.txt");
-        parse_log_name(OsStr::new(&name), PathBuf::from(name.clone())).unwrap()
-    }
-
-    #[test]
-    fn rejects_non_log_name() {
-        assert!(parse_log_name(OsStr::new("readme.txt"), PathBuf::from("readme.txt")).is_none());
-    }
-
-    #[test]
-    fn resolves_vrchat_under_local_low_sibling() {
-        let root = test_dir("local-low");
-        let local = root.join("Local");
-        let expected = root.join("LocalLow").join("VRChat").join("VRChat");
-        fs::create_dir(&local).unwrap();
-        fs::create_dir_all(&expected).unwrap();
-        assert_eq!(
-            vrchat_log_dir_from_local_app_data(&local).unwrap(),
-            expected
-        );
-        assert_ne!(
-            vrchat_log_dir_from_local_app_data(&local).unwrap(),
-            local.join("Low").join("VRChat").join("VRChat")
-        );
-        remove_test_dir(root);
-    }
-
-    #[test]
-    fn rejects_log_name_with_wrong_delimiters() {
-        let name = "output_log_2026_09_05_12_00_00.txt";
-        assert!(parse_log_name(OsStr::new(name), PathBuf::from(name)).is_none());
-    }
-
-    #[test]
-    fn parses_log_name() {
-        assert_eq!(
-            parse_log_name(
-                OsStr::new("output_log_2026-09-05_12-00-00.txt"),
-                PathBuf::from("output_log_2026-09-05_12-00-00.txt")
-            )
-            .unwrap()
-            .time,
-            seconds(12, 0, 0)
-        );
-    }
-
-    #[test]
-    fn selects_only_the_newest_contiguous_group() {
-        let entries = vec![entry("12-01-00"), entry("12-00-20"), entry("12-00-00")];
-        let group = latest_group(entries, 30);
-        assert_eq!(
-            group.iter().map(|e| e.time).collect::<Vec<_>>(),
-            vec![seconds(12, 1, 0)]
-        );
-    }
-
-    #[test]
-    fn retains_contiguous_entries_in_chronological_order() {
-        let entries = vec![entry("12-01-00"), entry("12-00-20"), entry("12-00-00")];
-        let group = latest_group(entries, 60);
-        assert_eq!(
-            group.iter().map(|e| e.time).collect::<Vec<_>>(),
-            vec![seconds(12, 0, 0), seconds(12, 0, 20), seconds(12, 1, 0)]
-        );
-    }
-
-    #[test]
-    fn keeps_only_the_fixed_window_below_the_newest_timestamp() {
-        let entries = vec![
-            entry("12-00-00"),
-            entry("12-00-20"),
-            entry("12-00-40"),
-            entry("12-01-00"),
-        ];
-        let group = latest_group(entries, 30);
-        assert_eq!(
-            group.iter().map(|entry| entry.time).collect::<Vec<_>>(),
-            vec![seconds(12, 0, 40), seconds(12, 1, 0)]
-        );
-    }
-
-    #[test]
-    fn validates_leap_days() {
-        assert!(civil_seconds(2024, 2, 29, 0, 0, 0).is_some());
-        assert!(civil_seconds(2025, 2, 29, 0, 0, 0).is_none());
-    }
-
-    fn config(
-        filter: Option<&str>,
-        case_sensitive: bool,
-        ignore_blank_lines: bool,
-        suppress_log_date: bool,
-    ) -> Config {
-        Config {
-            filter: filter.map(str::to_owned),
-            case_sensitive,
-            ignore_blank_lines,
-            colored_log_level: true,
-            suppress_log_date,
-            watch_new_files: false,
-            group_period_secs: 0,
-        }
-    }
-
-    #[test]
-    fn parses_cli_flags_and_defaults() {
-        let CliAction::Run(defaults) = parse_args(["vrc-tail"]).unwrap() else {
-            panic!();
-        };
-        assert_eq!(defaults.group_period_secs, 30);
-        assert!(defaults.watch_new_files);
-        assert!(defaults.colored_log_level);
-
-        let CliAction::Run(config) = parse_args([
-            "vrc-tail",
-            "-f",
-            "Error",
-            "-c",
-            "-s",
-            "-L",
-            "-d",
-            "-g",
-            "12",
-            "--no-watch",
-        ])
-        .unwrap() else {
-            panic!();
-        };
-        assert_eq!(config.filter.as_deref(), Some("Error"));
-        assert!(config.case_sensitive && config.ignore_blank_lines && config.suppress_log_date);
-        assert!(!config.colored_log_level && !config.watch_new_files);
-        assert_eq!(config.group_period_secs, 12);
-
-        let CliAction::Run(config) = parse_args([
-            "vrc-tail",
-            "--filter",
-            "Warn",
-            "--case-sensitive",
-            "--ignore-blank-lines",
-            "--no-colored-log-level",
-            "--suppress-log-date",
-            "--group-period",
-            "9",
-            "--no-watch",
-        ])
-        .unwrap() else {
-            panic!();
-        };
-        assert_eq!(config.filter.as_deref(), Some("Warn"));
-        assert!(config.case_sensitive && config.ignore_blank_lines && config.suppress_log_date);
-        assert!(!config.colored_log_level && !config.watch_new_files);
-        assert_eq!(config.group_period_secs, 9);
-    }
-
-    #[test]
-    fn rejects_invalid_cli_arguments_and_recognizes_meta_actions() {
-        for args in [
-            vec!["vrc-tail", "-f"],
-            vec!["vrc-tail", "--filter"],
-            vec!["vrc-tail", "-g"],
-            vec!["vrc-tail", "-g", "0"],
-            vec!["vrc-tail", "--group-period", "-1"],
-            vec!["vrc-tail", "--group-period", "no"],
-            vec!["vrc-tail", "--unknown"],
-        ] {
-            assert!(parse_args(args).is_err());
-        }
-        assert!(matches!(
-            parse_args(["vrc-tail", "-h"]),
-            Ok(CliAction::Help)
-        ));
-        assert!(matches!(
-            parse_args(["vrc-tail", "--help"]),
-            Ok(CliAction::Help)
-        ));
-        assert!(matches!(
-            parse_args(["vrc-tail", "--version"]),
-            Ok(CliAction::Version)
-        ));
-        assert!(matches!(
-            parse_args(["vrc-tail", "-V"]),
-            Ok(CliAction::Version)
-        ));
-    }
-
-    #[test]
-    fn initial_filter_respects_case_sensitivity() {
-        let CliAction::Run(config) = parse_args(["vrc-tail", "-f", "Error", "-c"]).unwrap() else {
-            panic!();
-        };
-        assert!(line_matches("Error", &config));
-        assert!(!line_matches("error", &config));
-    }
-
-    #[test]
-    fn console_input_filters_toggles_and_quits() {
-        let mut state = InputState::default();
-        let mut config = config(None, false, false, false);
-        let mut output = Vec::new();
-        assert_eq!(
-            state
-                .handle_utf16('/' as u16, &mut config, &mut output)
-                .unwrap(),
-            InputAction::Continue
-        );
-        for unit in "日本😀".encode_utf16() {
-            state.handle_utf16(unit, &mut config, &mut output).unwrap();
-        }
-        state
-            .handle_utf16('\r' as u16, &mut config, &mut output)
-            .unwrap();
-        assert_eq!(config.filter.as_deref(), Some("日本😀"));
-        state
-            .handle_utf16('/' as u16, &mut config, &mut output)
-            .unwrap();
-        for unit in "Error".encode_utf16() {
-            state.handle_utf16(unit, &mut config, &mut output).unwrap();
-        }
-        state
-            .handle_utf16('\r' as u16, &mut config, &mut output)
-            .unwrap();
-        assert!(line_matches("error", &config));
-        state
-            .handle_utf16('c' as u16, &mut config, &mut output)
-            .unwrap();
-        assert!(config.case_sensitive);
-        assert!(!line_matches("error", &config));
-        for command in ['?', 's', 'l', 'd'] {
-            state
-                .handle_utf16(command as u16, &mut config, &mut output)
-                .unwrap();
-        }
-        assert!(config.ignore_blank_lines && !config.colored_log_level && config.suppress_log_date);
-        state
-            .handle_utf16('r' as u16, &mut config, &mut output)
-            .unwrap();
-        assert!(config.filter.is_none());
-        assert_eq!(
-            state.handle_utf16(3, &mut config, &mut output).unwrap(),
-            InputAction::Quit
-        );
-        assert_eq!(
-            state
-                .handle_utf16('q' as u16, &mut config, &mut output)
-                .unwrap(),
-            InputAction::Quit
-        );
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("> filter = 日本😀")
-        );
-    }
-
-    #[test]
-    fn zero_unicode_key_events_do_not_enter_the_filter() {
-        let mut state = InputState::default();
-        let mut config = config(None, false, false, false);
-        let mut output = Vec::new();
-        for unit in ['/' as u16, 0, 'x' as u16, '\r' as u16] {
-            state.handle_utf16(unit, &mut config, &mut output).unwrap();
-        }
-        assert_eq!(config.filter.as_deref(), Some("x"));
-    }
-
-    #[test]
-    fn control_c_quits_while_q_remains_literal_in_a_filter() {
-        let mut state = InputState::default();
-        let mut config = config(None, false, false, false);
-        let mut output = Vec::new();
-        state
-            .handle_utf16('/' as u16, &mut config, &mut output)
-            .unwrap();
-        assert_eq!(
-            state
-                .handle_utf16('q' as u16, &mut config, &mut output)
-                .unwrap(),
-            InputAction::Continue
-        );
-        assert_eq!(state.text, "q");
-        assert_eq!(
-            state.handle_utf16(3, &mut config, &mut output).unwrap(),
-            InputAction::Quit
-        );
-    }
-
-    #[test]
-    fn interactive_output_is_flushed_before_waiting() {
-        let mut state = InputState::default();
-        let mut config = config(None, false, false, false);
-        let mut output = FlushWriter::default();
-        state
-            .handle_utf16('/' as u16, &mut config, &mut output)
-            .unwrap();
-        assert_eq!(output.bytes, b"/");
-        assert!(!output.flushed);
-        flush_before_wait(&mut output).unwrap();
-        assert!(output.flushed);
-
-        let error = flush_before_wait(&mut FlushWriter {
-            fail_flush: true,
-            ..FlushWriter::default()
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-    }
-
-    #[test]
-    fn assembles_crlf_and_split_utf8_without_retaining_complete_lines() {
-        let mut pending = Vec::new();
-        let mut lines = Vec::new();
-        consume_lines(&mut pending, b"hello\r", |line| {
-            lines.push(line.to_owned());
-            Ok::<_, io::Error>(())
-        })
-        .unwrap();
-        consume_lines(&mut pending, b"\nwarn \xE3\x81", |line| {
-            lines.push(line.to_owned());
-            Ok::<_, io::Error>(())
-        })
-        .unwrap();
-        consume_lines(&mut pending, b"\x82\n", |line| {
-            lines.push(line.to_owned());
-            Ok::<_, io::Error>(())
-        })
-        .unwrap();
-        assert_eq!(lines, ["hello", "warn あ"]);
-        assert!(pending.is_empty());
-
-        consume_lines(&mut pending, b"bad \xff\n", |line| {
-            lines.push(line.to_owned());
-            Ok::<_, io::Error>(())
-        })
-        .unwrap();
-        assert_eq!(lines.last().unwrap(), "bad �");
-    }
-
-    #[test]
-    fn filters_dates_levels_blanks_and_formats_without_color() {
-        let sensitive = config(Some("Warn"), true, true, false);
-        assert!(line_matches("Warn here", &sensitive));
-        assert!(!line_matches("warn here", &sensitive));
-        assert!(!line_matches(
-            "anything",
-            &config(Some("missing"), true, true, false)
-        ));
-        assert!(line_matches(
-            "WARN Ångström",
-            &config(Some("å"), false, false, false)
-        ));
-        assert_eq!(strip_log_date("2026.09.05 12:34:56 hello"), "hello");
-        assert_eq!(strip_log_date("not dated"), "not dated");
-        assert_eq!(
-            log_level("2026.09.05 12:34:56 Warning details"),
-            Some(("Warning", " details"))
-        );
-        assert_eq!(log_level("2026.09.05 12:34:56 Debug details"), None);
-        let mut output = Vec::new();
-        write_line(
-            &mut output,
-            "2026.09.05 12:34:56 Warning details",
-            2,
-            &config(None, true, false, true),
-            false,
-            "2026-09-05 12:34:56.0000",
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "2026-09-05 12:34:56.0000 [2] Warning details\n"
-        );
-        let mut output = Vec::new();
-        write_line(
-            &mut output,
-            "",
-            0,
-            &config(None, true, true, false),
-            false,
-            "now",
-        )
-        .unwrap();
-        assert!(output.is_empty());
-    }
-
-    #[test]
-    fn cycles_through_the_legacy_file_colors() {
-        let mut output = Vec::new();
-        for index in 0..7 {
-            write_line(
-                &mut output,
-                "line",
-                index,
-                &config(None, true, false, false),
-                true,
-                "now",
-            )
-            .unwrap();
-        }
-        let output = String::from_utf8(output).unwrap();
-        let colors = output.lines().map(|line| &line[2..4]).collect::<Vec<_>>();
-        assert_eq!(colors, ["32", "34", "35", "36", "37", "90", "32"]);
-    }
-
-    #[test]
-    fn timestamp_has_fixed_zero_padded_shape() {
-        let timestamp = formatted_timestamp();
-        assert_eq!(timestamp.len(), 24);
-        for index in [4, 7, 10, 13, 16, 19] {
-            assert!(matches!(
-                timestamp.as_bytes()[index],
-                b'-' | b' ' | b':' | b'.'
-            ));
-        }
-        assert!(
-            timestamp
-                .bytes()
-                .enumerate()
-                .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19)
-                    || byte.is_ascii_digit())
-        );
-        assert_eq!(timestamp.as_bytes()[20], b'0');
-    }
-
-    #[test]
-    fn initial_content_is_skipped_and_appended_content_is_printed_once() {
-        let dir = test_dir("initial-and-append");
-        let entry = test_log(&dir, 0);
-        fs::write(&entry.path, "old\n").unwrap();
-        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
-        let mut output = Vec::new();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        assert!(output.is_empty());
-
-        fs::write(&entry.path, "old\nnew\n").unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(!output.contains("old\n"));
-        assert_eq!(output.matches("new\n").count(), 1);
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn initial_open_failure_warns_and_is_retried_by_reconciliation() {
-        let dir = test_dir("initial-open-recovery");
-        let missing = test_log(&dir, 0);
-        let good = test_log(&dir, 1);
-        fs::remove_file(&missing.path).unwrap();
-        let group = vec![missing.clone(), good];
-        let mut warnings = Vec::new();
-        let mut tails = TailSet::open_initial(group.clone(), &mut warnings).unwrap();
-        assert_eq!(tails.files.len(), 1);
-        assert!(String::from_utf8_lossy(&warnings).contains("failed to open"));
-
-        fs::write(&missing.path, "recovered\n").unwrap();
-        tails.reconcile(group, &mut warnings).unwrap();
-        assert_eq!(tails.files.len(), 2);
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn recovered_startup_file_starts_at_eof() {
-        let dir = test_dir("startup-eof-recovery");
-        let entry = test_log(&dir, 0);
-        fs::write(&entry.path, "before startup\n").unwrap();
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&entry.path)
-            .unwrap();
-        let mut warnings = Vec::new();
-        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut warnings).unwrap();
-        assert!(tails.files.is_empty());
-        drop(lock);
-
-        tails.reconcile(vec![entry.clone()], &mut warnings).unwrap();
-        let mut output = Vec::new();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        assert!(output.is_empty());
-
-        fs::write(&entry.path, "before startup\nafter startup\n").unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(!output.contains("before startup"));
-        assert!(output.contains("after startup"));
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn fixed_selection_drops_deleted_files_and_startup_state() {
-        let dir = test_dir("fixed-deletion");
-        let active = test_log(&dir, 0);
-        let pending = test_log(&dir, 1);
-        let lock = OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(&pending.path)
-            .unwrap();
-        let mut group = vec![active.clone(), pending.clone()];
-        let mut warnings = Vec::new();
-        let mut tails = TailSet::open_initial(group.clone(), &mut warnings).unwrap();
-        assert_eq!(tails.files.len(), 1);
-        drop(lock);
-
-        fs::remove_file(&active.path).unwrap();
-        fs::remove_file(&pending.path).unwrap();
-        tails.reconcile_fixed(&mut group, &mut warnings).unwrap();
-        assert!(group.is_empty());
-        assert!(tails.files.is_empty());
-
-        fs::write(&pending.path, "new generation\n").unwrap();
-        tails.reconcile(vec![pending], &mut warnings).unwrap();
-        let mut output = Vec::new();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("new generation")
-        );
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn fixed_selection_keeps_unconfirmed_metadata_errors() {
-        let mut group = vec![LogEntry {
-            path: PathBuf::from(OsString::from("invalid\0path")),
-            time: 0,
-        }];
-        let mut warnings = Vec::new();
-        TailSet::default()
-            .reconcile_fixed(&mut group, &mut warnings)
-            .unwrap();
-        assert_eq!(group.len(), 1);
-        assert!(String::from_utf8_lossy(&warnings).contains("failed to read metadata"));
-    }
-
-    #[test]
-    fn newly_discovered_file_is_read_from_byte_zero() {
-        let dir = test_dir("new-file");
-        let first = test_log(&dir, 0);
-        let second = test_log(&dir, 1);
-        fs::write(&second.path, "new file\n").unwrap();
-        let mut tails = TailSet::open_initial(vec![first], &mut io::sink()).unwrap();
-        let mut output = Vec::new();
-        tails.reconcile(vec![second], &mut io::sink()).unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .ends_with(" [0] new file\n")
-        );
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn truncation_reads_the_replacement_from_byte_zero() {
-        let dir = test_dir("truncation");
-        let entry = test_log(&dir, 0);
-        fs::write(&entry.path, "before\n").unwrap();
-        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
-        fs::write(&entry.path, "after\n").unwrap();
-        let mut output = Vec::new();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        assert!(String::from_utf8(output).unwrap().ends_with(" [0] after\n"));
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn truncation_releases_an_oversized_unfinished_line() {
-        let dir = test_dir("truncation-capacity");
-        let entry = test_log(&dir, 0);
-        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
-        fs::write(&entry.path, vec![b'x'; 8 * 1024]).unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut io::sink())
-            .unwrap();
-        assert!(tails.files[0].pending.capacity() > 4 * 1024);
-
-        fs::write(&entry.path, []).unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut io::sink())
-            .unwrap();
-        assert_eq!(tails.files[0].pending.capacity(), 0);
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn a_read_failure_does_not_stop_other_files_and_can_recover() {
-        let dir = test_dir("read-recovery");
-        let bad = test_log(&dir, 0);
-        let good = test_log(&dir, 1);
-        fs::write(&bad.path, "recovered\n").unwrap();
-        fs::write(&good.path, "good\n").unwrap();
-        let write_only = OpenOptions::new().write(true).open(&bad.path).unwrap();
-        let mut tails = TailSet {
-            files: vec![
-                ActiveFile {
-                    entry: bad.clone(),
-                    index: 0,
-                    file: write_only,
-                    offset: 0,
-                    pending: Vec::new(),
-                },
-                ActiveFile {
-                    entry: good.clone(),
-                    index: 1,
-                    file: File::open(&good.path).unwrap(),
-                    offset: 0,
-                    pending: Vec::new(),
-                },
-            ],
-            ..TailSet::default()
-        };
-        let mut output = Vec::new();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        let first = String::from_utf8_lossy(&output);
-        assert!(first.contains("failed to read"));
-        assert!(first.contains(" [1] good\n"));
-
-        tails.files[0].file = File::open(&bad.path).unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut output)
-            .unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains(" [0] recovered\n")
-        );
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn test_directories_never_reuse_an_existing_path() {
-        let first = test_dir("unique");
-        fs::write(first.join("sentinel"), []).unwrap();
-        let second = test_dir("unique");
-        assert_ne!(first, second);
-        assert!(first.join("sentinel").exists());
-        remove_test_dir(first);
-        remove_test_dir(second);
-    }
-
-    #[test]
-    fn repeated_rotations_retain_only_the_current_group() {
-        let dir = test_dir("rotations");
-        let mut tails = TailSet::default();
-        for i in 0..1_000 {
-            tails
-                .reconcile(vec![test_log(&dir, i)], &mut io::sink())
-                .unwrap();
-            assert_eq!(tails.files.len(), 1);
-        }
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn watched_empty_transition_prints_one_separator_between_groups() {
-        let dir = test_dir("empty-transition");
-        let old = test_log(&dir, 0);
-        let new = test_log(&dir, 1);
-        let mut tails = TailSet::default();
-        let mut output = Vec::new();
-
-        tails.reconcile(Vec::new(), &mut output).unwrap();
-        tails.reconcile(vec![old], &mut output).unwrap();
-        assert!(output.is_empty());
-        tails.reconcile(Vec::new(), &mut output).unwrap();
-        tails.reconcile(Vec::new(), &mut output).unwrap();
-        assert!(output.is_empty());
-        tails.reconcile(vec![new.clone()], &mut output).unwrap();
-        tails.reconcile(vec![new], &mut output).unwrap();
-
-        assert_eq!(
-            String::from_utf8(output)
-                .unwrap()
-                .matches(&"-".repeat(79))
-                .count(),
-            1
-        );
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn chained_groups_drop_handles_outside_the_fixed_window() {
-        let dir = test_dir("bounded-window");
-        let entries = (0..4)
-            .map(|index| LogEntry {
-                time: index * 20,
-                ..test_log(&dir, index as usize)
-            })
-            .collect::<Vec<_>>();
-        let mut tails = TailSet::default();
-        for end in 0..entries.len() {
-            let group = latest_group(entries[..=end].to_vec(), 30);
-            tails.reconcile(group, &mut io::sink()).unwrap();
-            assert!(tails.files.len() <= 2);
-        }
-        assert_eq!(
-            tails
-                .files
-                .iter()
-                .map(|file| file.entry.time)
-                .collect::<Vec<_>>(),
-            vec![40, 60]
-        );
-        remove_test_dir(dir);
-    }
-
-    #[test]
-    fn drained_large_line_releases_pending_capacity() {
-        let dir = test_dir("pending-capacity");
-        let entry = test_log(&dir, 0);
-        let mut tails = TailSet::open_initial(vec![entry.clone()], &mut io::sink()).unwrap();
-        let mut line = vec![b'x'; 8 * 1024];
-        line.push(b'\n');
-        fs::write(&entry.path, line).unwrap();
-        tails
-            .drain(&config(None, true, false, false), false, &mut io::sink())
-            .unwrap();
-        assert!(tails.files[0].pending.capacity() <= 4 * 1024);
-        remove_test_dir(dir);
-    }
-}
+mod tests;
