@@ -122,6 +122,18 @@ mod tests {
     }
 
     #[test]
+    fn includes_entry_exactly_one_period_before_newest() {
+        let entries = vec![entry("12-01-00"), entry("12-00-00")];
+
+        let group = latest_group(entries, 60);
+
+        assert_eq!(
+            group.iter().map(|entry| entry.time).collect::<Vec<_>>(),
+            vec![timestamp(12, 0, 0), timestamp(12, 1, 0)]
+        );
+    }
+
+    #[test]
     fn timestamp_has_fixed_zero_padded_shape() {
         let timestamp = formatted_timestamp();
 
