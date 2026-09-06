@@ -6,11 +6,12 @@ description = "tail -f for VRChat logs"
 license = "Zlib"
 
 [dependencies]
+chrono = "0.4"
+clap = { version = "4.6", features = ["derive"] }
 windows-sys = { version = "0.61.2", default-features = false, features = [
   "Win32_Foundation",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
-  "Win32_System_SystemInformation",
   "Win32_System_Threading",
 ] }
 

@@ -1,4 +1,7 @@
 use super::*;
+use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
+use clap::Parser;
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,27 +29,21 @@ fn remove_test_dir(dir: PathBuf) {
     fs::remove_dir_all(dir).unwrap();
 }
 
+fn test_time(offset_secs: i64) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(2026, 9, 5)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        + TimeDelta::seconds(offset_secs)
+}
+
 fn test_log(dir: &Path, index: usize) -> LogEntry {
     let path = dir.join(format!("output_log_2026-09-05_12-00-{index:02}.txt"));
     fs::write(&path, []).unwrap();
     LogEntry {
         path,
-        time: index as i64,
+        time: test_time(index as i64),
     }
-}
-
-fn seconds(hour: u32, minute: u32, second: u32) -> i64 {
-    civil_seconds(2026, 9, 5, hour, minute, second).unwrap()
-}
-
-fn entry(time: &str) -> LogEntry {
-    let name = format!("output_log_2026-09-05_{time}.txt");
-    parse_log_name(OsStr::new(&name), PathBuf::from(name.clone())).unwrap()
-}
-
-#[test]
-fn rejects_non_log_name() {
-    assert!(parse_log_name(OsStr::new("readme.txt"), PathBuf::from("readme.txt")).is_none());
 }
 
 #[test]
@@ -67,174 +64,18 @@ fn resolves_vrchat_under_local_low_sibling() {
     remove_test_dir(root);
 }
 
-#[test]
-fn rejects_log_name_with_wrong_delimiters() {
-    let name = "output_log_2026_09_05_12_00_00.txt";
-    assert!(parse_log_name(OsStr::new(name), PathBuf::from(name)).is_none());
-}
-
-#[test]
-fn parses_log_name() {
-    assert_eq!(
-        parse_log_name(
-            OsStr::new("output_log_2026-09-05_12-00-00.txt"),
-            PathBuf::from("output_log_2026-09-05_12-00-00.txt")
-        )
-        .unwrap()
-        .time,
-        seconds(12, 0, 0)
-    );
-}
-
-#[test]
-fn selects_only_entries_in_the_newest_relative_window() {
-    let entries = vec![entry("12-01-00"), entry("12-00-20"), entry("12-00-00")];
-    let group = latest_group(entries, 30);
-    assert_eq!(
-        group.iter().map(|e| e.time).collect::<Vec<_>>(),
-        vec![seconds(12, 1, 0)]
-    );
-}
-
-#[test]
-fn retains_newest_relative_window_in_chronological_order() {
-    let entries = vec![entry("12-01-00"), entry("12-00-20"), entry("12-00-00")];
-    let group = latest_group(entries, 60);
-    assert_eq!(
-        group.iter().map(|e| e.time).collect::<Vec<_>>(),
-        vec![seconds(12, 0, 0), seconds(12, 0, 20), seconds(12, 1, 0)]
-    );
-}
-
-#[test]
-fn keeps_only_the_fixed_window_below_the_newest_timestamp() {
-    let entries = vec![
-        entry("12-00-00"),
-        entry("12-00-20"),
-        entry("12-00-40"),
-        entry("12-01-00"),
-    ];
-    let group = latest_group(entries, 30);
-    assert_eq!(
-        group.iter().map(|entry| entry.time).collect::<Vec<_>>(),
-        vec![seconds(12, 0, 40), seconds(12, 1, 0)]
-    );
-}
-
-#[test]
-fn validates_leap_days() {
-    assert!(civil_seconds(2024, 2, 29, 0, 0, 0).is_some());
-    assert!(civil_seconds(2025, 2, 29, 0, 0, 0).is_none());
-}
-
 fn config(
     filter: Option<&str>,
     case_sensitive: bool,
     ignore_blank_lines: bool,
     suppress_log_date: bool,
 ) -> Config {
-    let mut config = Config {
-        filter: None,
-        normalized_filter: None,
-        case_sensitive,
-        ignore_blank_lines,
-        colored_log_level: true,
-        suppress_log_date,
-        watch_new_files: false,
-        group_period_secs: 0,
-    };
+    let mut config = Config::from(Cli::try_parse_from(["vrc-tail", "--no-watch"]).unwrap());
+    config.case_sensitive = case_sensitive;
+    config.ignore_blank_lines = ignore_blank_lines;
+    config.suppress_log_date = suppress_log_date;
     config.set_filter(filter.map(str::to_owned));
     config
-}
-
-#[test]
-fn parses_cli_flags_and_defaults() {
-    let CliAction::Run(defaults) = parse_args(["vrc-tail"]).unwrap() else {
-        panic!();
-    };
-    assert_eq!(defaults.group_period_secs, 30);
-    assert!(defaults.watch_new_files);
-    assert!(defaults.colored_log_level);
-
-    let CliAction::Run(config) = parse_args([
-        "vrc-tail",
-        "-f",
-        "Error",
-        "-c",
-        "-s",
-        "-L",
-        "-d",
-        "-g",
-        "12",
-        "--no-watch",
-    ])
-    .unwrap() else {
-        panic!();
-    };
-    assert_eq!(config.filter.as_deref(), Some("Error"));
-    assert!(config.case_sensitive && config.ignore_blank_lines && config.suppress_log_date);
-    assert!(!config.colored_log_level && !config.watch_new_files);
-    assert_eq!(config.group_period_secs, 12);
-
-    let CliAction::Run(config) = parse_args([
-        "vrc-tail",
-        "--filter",
-        "Warn",
-        "--case-sensitive",
-        "--ignore-blank-lines",
-        "--no-colored-log-level",
-        "--suppress-log-date",
-        "--group-period",
-        "9",
-        "--no-watch",
-    ])
-    .unwrap() else {
-        panic!();
-    };
-    assert_eq!(config.filter.as_deref(), Some("Warn"));
-    assert!(config.case_sensitive && config.ignore_blank_lines && config.suppress_log_date);
-    assert!(!config.colored_log_level && !config.watch_new_files);
-    assert_eq!(config.group_period_secs, 9);
-}
-
-#[test]
-fn rejects_invalid_cli_arguments_and_recognizes_meta_actions() {
-    for args in [
-        vec!["vrc-tail", "-f"],
-        vec!["vrc-tail", "--filter"],
-        vec!["vrc-tail", "-g"],
-        vec!["vrc-tail", "-g", "0"],
-        vec!["vrc-tail", "--group-period", "-1"],
-        vec!["vrc-tail", "--group-period", "no"],
-        vec!["vrc-tail", "--unknown"],
-    ] {
-        assert!(parse_args(args).is_err());
-    }
-    assert!(matches!(
-        parse_args(["vrc-tail", "-h"]),
-        Ok(CliAction::Help)
-    ));
-    assert!(matches!(
-        parse_args(["vrc-tail", "--help"]),
-        Ok(CliAction::Help)
-    ));
-    assert!(matches!(
-        parse_args(["vrc-tail", "--version"]),
-        Ok(CliAction::Version)
-    ));
-    assert!(matches!(
-        parse_args(["vrc-tail", "-V"]),
-        Ok(CliAction::Version)
-    ));
-}
-
-#[test]
-fn initial_filter_respects_case_sensitivity() {
-    let CliAction::Run(config) = parse_args(["vrc-tail", "-f", "Error", "-c"]).unwrap() else {
-        panic!();
-    };
-    assert!(line_matches("Error", &config));
-    assert!(!line_matches("error", &config));
 }
 
 #[test]
@@ -254,7 +95,7 @@ fn console_input_filters_toggles_and_quits() {
     state
         .handle_utf16('\r' as u16, &mut config, &mut output)
         .unwrap();
-    assert_eq!(config.filter.as_deref(), Some("日本😀"));
+    assert_eq!(config.filter_text(), Some("日本😀"));
     state
         .handle_utf16('/' as u16, &mut config, &mut output)
         .unwrap();
@@ -264,12 +105,12 @@ fn console_input_filters_toggles_and_quits() {
     state
         .handle_utf16('\r' as u16, &mut config, &mut output)
         .unwrap();
-    assert!(line_matches("error", &config));
+    assert!(config.line_matches("error"));
     state
         .handle_utf16('c' as u16, &mut config, &mut output)
         .unwrap();
     assert!(config.case_sensitive);
-    assert!(!line_matches("error", &config));
+    assert!(!config.line_matches("error"));
     for command in ['?', 's', 'l', 'd'] {
         state
             .handle_utf16(command as u16, &mut config, &mut output)
@@ -279,7 +120,7 @@ fn console_input_filters_toggles_and_quits() {
     state
         .handle_utf16('r' as u16, &mut config, &mut output)
         .unwrap();
-    assert!(config.filter.is_none());
+    assert_eq!(config.filter_text(), None);
     assert_eq!(
         state.handle_utf16(3, &mut config, &mut output).unwrap(),
         InputAction::Quit
@@ -305,7 +146,7 @@ fn zero_unicode_key_events_do_not_enter_the_filter() {
     for unit in ['/' as u16, 0, 'x' as u16, '\r' as u16] {
         state.handle_utf16(unit, &mut config, &mut output).unwrap();
     }
-    assert_eq!(config.filter.as_deref(), Some("x"));
+    assert_eq!(config.filter_text(), Some("x"));
 }
 
 #[test]
@@ -373,16 +214,10 @@ fn assembles_crlf_and_split_utf8_without_retaining_complete_lines() {
 #[test]
 fn filters_dates_levels_blanks_and_formats_without_color() {
     let sensitive = config(Some("Warn"), true, true, false);
-    assert!(line_matches("Warn here", &sensitive));
-    assert!(!line_matches("warn here", &sensitive));
-    assert!(!line_matches(
-        "anything",
-        &config(Some("missing"), true, true, false)
-    ));
-    assert!(line_matches(
-        "WARN Ångström",
-        &config(Some("å"), false, false, false)
-    ));
+    assert!(sensitive.line_matches("Warn here"));
+    assert!(!sensitive.line_matches("warn here"));
+    assert!(!config(Some("missing"), true, true, false).line_matches("anything"));
+    assert!(config(Some("å"), false, false, false).line_matches("WARN Ångström"));
     assert_eq!(strip_log_date("2026.09.05 12:34:56 hello"), "hello");
     assert_eq!(strip_log_date("not dated"), "not dated");
     assert_eq!(
@@ -434,27 +269,6 @@ fn cycles_through_the_legacy_file_colors() {
     let output = String::from_utf8(output).unwrap();
     let colors = output.lines().map(|line| &line[2..4]).collect::<Vec<_>>();
     assert_eq!(colors, ["32", "34", "35", "36", "37", "90", "32"]);
-}
-
-#[test]
-fn timestamp_has_fixed_zero_padded_shape() {
-    let timestamp = formatted_timestamp();
-    assert_eq!(timestamp.len(), 24);
-    for index in [4, 7, 10, 13, 16, 19] {
-        assert!(matches!(
-            timestamp.as_bytes()[index],
-            b'-' | b' ' | b':' | b'.'
-        ));
-    }
-    assert!(
-        timestamp
-            .bytes()
-            .enumerate()
-            .all(
-                |(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
-            )
-    );
-    assert_eq!(timestamp.as_bytes()[20], b'0');
 }
 
 #[test]
@@ -572,7 +386,7 @@ fn fixed_selection_drops_deleted_files_and_startup_state() {
 fn fixed_selection_keeps_unconfirmed_metadata_errors() {
     let mut group = vec![LogEntry {
         path: PathBuf::from(OsString::from("invalid\0path")),
-        time: 0,
+        time: test_time(0),
     }];
     let mut warnings = Vec::new();
     TailSet::default()
@@ -739,13 +553,13 @@ fn chained_groups_drop_handles_outside_the_fixed_window() {
     let dir = test_dir("bounded-window");
     let entries = (0..4)
         .map(|index| LogEntry {
-            time: index * 20,
+            time: test_time(index * 20),
             ..test_log(&dir, index as usize)
         })
         .collect::<Vec<_>>();
     let mut tails = TailSet::default();
     for end in 0..entries.len() {
-        let group = latest_group(entries[..=end].to_vec(), 30);
+        let group = log_entry::latest_group(entries[..=end].to_vec(), 30);
         tails.reconcile(group, &mut io::sink()).unwrap();
         assert!(tails.files.len() <= 2);
     }
@@ -755,7 +569,7 @@ fn chained_groups_drop_handles_outside_the_fixed_window() {
             .iter()
             .map(|file| file.entry.time)
             .collect::<Vec<_>>(),
-        vec![40, 60]
+        vec![test_time(40), test_time(60)]
     );
     remove_test_dir(dir);
 }

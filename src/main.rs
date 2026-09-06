@@ -1,5 +1,7 @@
+use clap::Parser;
+use cli::{Cli, Config};
+use log_entry::{LogEntry, formatted_timestamp, scan_group};
 use std::env;
-use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -18,185 +20,14 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
-const DEFAULT_GROUP_PERIOD_SECS: i64 = 30;
+mod cli;
+mod log_entry;
+
 const READ_BUFFER_SIZE: usize = 16 * 1024;
 const RETAINED_PENDING_BUFFER_SIZE: usize = 4 * 1024;
 const LOG_DATE_PREFIX_LEN: usize = 20;
 const SEPARATOR_WIDTH: usize = 79;
 const LEGACY_FILE_COLORS: [usize; 6] = [32, 34, 35, 36, 37, 90];
-
-struct Config {
-    filter: Option<String>,
-    normalized_filter: Option<String>,
-    case_sensitive: bool,
-    ignore_blank_lines: bool,
-    colored_log_level: bool,
-    suppress_log_date: bool,
-    watch_new_files: bool,
-    group_period_secs: i64,
-}
-
-impl Config {
-    fn set_filter(&mut self, filter: Option<String>) {
-        self.normalized_filter = filter.as_ref().map(|value| value.to_lowercase());
-        self.filter = filter;
-    }
-}
-
-#[derive(Clone)]
-struct LogEntry {
-    path: PathBuf,
-    time: i64,
-}
-
-fn parse_log_name(name: &OsStr, path: PathBuf) -> Option<LogEntry> {
-    let name = name.to_str()?;
-    let value = name.strip_prefix("output_log_")?.strip_suffix(".txt")?;
-    let bytes = value.as_bytes();
-    let format = b"0000-00-00_00-00-00";
-    if bytes.len() != format.len()
-        || bytes.iter().zip(format).any(|(actual, expected)| {
-            if expected.is_ascii_digit() {
-                !actual.is_ascii_digit()
-            } else {
-                actual != expected
-            }
-        })
-    {
-        return None;
-    }
-    let mut fields = value.split(['-', '_']);
-    let year = fields.next()?.parse::<i64>().ok()?;
-    let month = fields.next()?.parse().ok()?;
-    let day = fields.next()?.parse().ok()?;
-    let hour = fields.next()?.parse().ok()?;
-    let minute = fields.next()?.parse().ok()?;
-    let second = fields.next()?.parse().ok()?;
-    Some(LogEntry {
-        path,
-        time: civil_seconds(year, month, day, hour, minute, second)?,
-    })
-}
-
-fn civil_seconds(
-    year: i64,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
-) -> Option<i64> {
-    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 || day == 0 {
-        return None;
-    }
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_month = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if day > days_in_month[month as usize - 1] {
-        return None;
-    }
-    let adjusted_year = year - i64::from(month <= 2);
-    let era = adjusted_year.div_euclid(400);
-    let year_of_era = adjusted_year - era * 400;
-    let month = i64::from(month);
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
-    // A naive civil timestamp is sufficient because log names have no timezone and are compared only with each other.
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
-}
-
-fn latest_group(mut entries: Vec<LogEntry>, period: i64) -> Vec<LogEntry> {
-    entries.sort_by_key(|entry| entry.time);
-    if let Some(newest) = entries.last().map(|entry| entry.time) {
-        entries.retain(|entry| entry.time >= newest.saturating_sub(period));
-    }
-    entries
-}
-
-fn scan_group(dir: &Path, period: i64) -> io::Result<Vec<LogEntry>> {
-    let mut entries = Vec::new();
-    for item in dir.read_dir()? {
-        let item = item?;
-        if let Some(entry) = parse_log_name(&item.file_name(), item.path()) {
-            entries.push(entry);
-        }
-    }
-    Ok(latest_group(entries, period))
-}
-
-enum CliAction {
-    Run(Config),
-    Help,
-    Version,
-}
-
-fn parse_args<I, S>(args: I) -> Result<CliAction, String>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<OsString>,
-{
-    let mut args = args.into_iter().map(Into::into).skip(1);
-    let mut config = Config {
-        filter: None,
-        normalized_filter: None,
-        case_sensitive: false,
-        ignore_blank_lines: false,
-        colored_log_level: true,
-        suppress_log_date: false,
-        watch_new_files: true,
-        group_period_secs: DEFAULT_GROUP_PERIOD_SECS,
-    };
-    while let Some(argument) = args.next() {
-        let argument = argument
-            .into_string()
-            .map_err(|_| "arguments must be Unicode".to_owned())?;
-        match argument.as_str() {
-            "-h" | "--help" => return Ok(CliAction::Help),
-            "-V" | "--version" => return Ok(CliAction::Version),
-            "-f" | "--filter" => {
-                config.set_filter(Some(next_arg(&mut args, &argument)?));
-            }
-            "-c" | "--case-sensitive" => config.case_sensitive = true,
-            "-s" | "--ignore-blank-lines" => config.ignore_blank_lines = true,
-            "-L" | "--no-colored-log-level" => config.colored_log_level = false,
-            "-d" | "--suppress-log-date" => config.suppress_log_date = true,
-            "-g" | "--group-period" => {
-                let value = next_arg(&mut args, &argument)?;
-                config.group_period_secs = value
-                    .parse()
-                    .ok()
-                    .filter(|period: &i64| *period > 0)
-                    .ok_or_else(|| "group period must be a positive number".to_owned())?;
-            }
-            "--no-watch" => config.watch_new_files = false,
-            _ => return Err(format!("unknown argument: {argument}")),
-        }
-    }
-    Ok(CliAction::Run(config))
-}
-
-fn next_arg<I>(args: &mut I, option: &str) -> Result<String, String>
-where
-    I: Iterator<Item = OsString>,
-{
-    args.next()
-        .ok_or_else(|| format!("missing value for {option}"))?
-        .into_string()
-        .map_err(|_| "arguments must be Unicode".to_owned())
-}
 
 #[derive(Debug, PartialEq)]
 enum InputAction {
@@ -255,7 +86,7 @@ impl InputState {
                 writeln!(
                     out,
                     "\n> filter = {}",
-                    config.filter.as_deref().unwrap_or_default()
+                    config.filter_text().unwrap_or_default()
                 )?;
             } else {
                 self.text.push(character);
@@ -516,14 +347,8 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let result = match parse_args(env::args_os()) {
-        Ok(CliAction::Help) => print_help(&mut io::stdout()),
-        Ok(CliAction::Version) => {
-            writeln!(io::stdout(), "{}", env!("CARGO_PKG_VERSION"))
-        }
-        Ok(CliAction::Run(config)) => vrchat_log_dir().and_then(|dir| run_in_dir(config, &dir)),
-        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
-    };
+    let config = Config::from(Cli::parse());
+    let result = vrchat_log_dir().and_then(|dir| run_in_dir(config, &dir));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
@@ -532,25 +357,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn print_help<W: Write>(out: &mut W) -> io::Result<()> {
-    writeln!(out, "Usage: vrc-tail [OPTIONS]")?;
-    writeln!(out, "  -f, --filter <str>          filter")?;
-    writeln!(out, "  -c, --case-sensitive         case sensitive")?;
-    writeln!(out, "  -s, --ignore-blank-lines     ignore blank lines")?;
-    writeln!(out, "  -L, --no-colored-log-level   no colored log level")?;
-    writeln!(out, "  -d, --suppress-log-date      suppress log date")?;
-    writeln!(
-        out,
-        "  -g, --group-period <sec>     log group period (seconds)"
-    )?;
-    writeln!(
-        out,
-        "      --no-watch               do not add new log files"
-    )?;
-    writeln!(out, "  -h, --help                   print help")?;
-    writeln!(out, "  -V, --version                print version")
 }
 
 struct ActiveFile {
@@ -813,21 +619,6 @@ fn consume_lines<E>(
     Ok(())
 }
 
-fn line_matches(line: &str, config: &Config) -> bool {
-    let Some(filter) = config.filter.as_deref() else {
-        return true;
-    };
-    if config.case_sensitive {
-        line.contains(filter)
-    } else {
-        let normalized_filter = config
-            .normalized_filter
-            .as_deref()
-            .expect("normalized filter must accompany a filter");
-        normalized_filter.is_empty() || line.to_lowercase().contains(normalized_filter)
-    }
-}
-
 fn strip_log_date(line: &str) -> &str {
     if has_log_date_prefix(line) {
         &line[LOG_DATE_PREFIX_LEN..]
@@ -860,24 +651,6 @@ fn has_log_date_prefix(line: &str) -> bool {
             .all(|(i, byte)| matches!(i, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
 }
 
-fn formatted_timestamp() -> String {
-    let mut now = windows_sys::Win32::Foundation::SYSTEMTIME {
-        wYear: 0,
-        wMonth: 0,
-        wDayOfWeek: 0,
-        wDay: 0,
-        wHour: 0,
-        wMinute: 0,
-        wSecond: 0,
-        wMilliseconds: 0,
-    };
-    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut now) };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:04}",
-        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds
-    )
-}
-
 fn write_line<W: Write>(
     out: &mut W,
     line: &str,
@@ -886,7 +659,7 @@ fn write_line<W: Write>(
     color_output: bool,
     timestamp: &str,
 ) -> io::Result<()> {
-    if !line_matches(line, config) || (config.ignore_blank_lines && line.is_empty()) {
+    if !config.line_matches(line) || (config.ignore_blank_lines && line.is_empty()) {
         return Ok(());
     }
     let prefix = format!("{timestamp} [{index}] ");
