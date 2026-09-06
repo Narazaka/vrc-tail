@@ -565,6 +565,7 @@ struct ActiveFile {
 struct TailSet {
     files: Vec<ActiveFile>,
     startup_pending: Vec<LogEntry>,
+    separator_pending: bool,
     read_buffer: Box<[u8; 16 * 1024]>,
 }
 
@@ -573,6 +574,7 @@ impl Default for TailSet {
         Self {
             files: Vec::new(),
             startup_pending: Vec::new(),
+            separator_pending: false,
             read_buffer: Box::new([0; 16 * 1024]),
         }
     }
@@ -613,20 +615,25 @@ impl TailSet {
         warnings: &mut W,
     ) -> io::Result<()> {
         group.sort_by_key(|entry| entry.time);
+        if group.is_empty() && (!self.files.is_empty() || !self.startup_pending.is_empty()) {
+            self.separator_pending = true;
+        }
         let reset = !group.is_empty()
-            && (!self.files.is_empty() || !self.startup_pending.is_empty())
-            && !group.iter().any(|entry| {
-                self.files
-                    .iter()
-                    .any(|active| active.entry.path == entry.path)
-                    || self
-                        .startup_pending
-                        .iter()
-                        .any(|pending| pending.path == entry.path)
-            });
+            && (self.separator_pending
+                || ((!self.files.is_empty() || !self.startup_pending.is_empty())
+                    && !group.iter().any(|entry| {
+                        self.files
+                            .iter()
+                            .any(|active| active.entry.path == entry.path)
+                            || self
+                                .startup_pending
+                                .iter()
+                                .any(|pending| pending.path == entry.path)
+                    })));
         if reset {
             self.files.clear();
             self.startup_pending.clear();
+            self.separator_pending = false;
             writeln!(warnings, "{}", "-".repeat(79))?;
         }
 
@@ -1682,6 +1689,33 @@ mod tests {
                 .unwrap();
             assert_eq!(tails.files.len(), 1);
         }
+        remove_test_dir(dir);
+    }
+
+    #[test]
+    fn watched_empty_transition_prints_one_separator_between_groups() {
+        let dir = test_dir("empty-transition");
+        let old = test_log(&dir, 0);
+        let new = test_log(&dir, 1);
+        let mut tails = TailSet::default();
+        let mut output = Vec::new();
+
+        tails.reconcile(Vec::new(), &mut output).unwrap();
+        tails.reconcile(vec![old], &mut output).unwrap();
+        assert!(output.is_empty());
+        tails.reconcile(Vec::new(), &mut output).unwrap();
+        tails.reconcile(Vec::new(), &mut output).unwrap();
+        assert!(output.is_empty());
+        tails.reconcile(vec![new.clone()], &mut output).unwrap();
+        tails.reconcile(vec![new], &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches(&"-".repeat(79))
+                .count(),
+            1
+        );
         remove_test_dir(dir);
     }
 
