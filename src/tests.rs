@@ -1,6 +1,7 @@
 use super::*;
 use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use clap::Parser;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
@@ -78,59 +79,73 @@ fn config(
     config
 }
 
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
 #[test]
-fn console_input_filters_toggles_and_quits() {
+fn plain_q_quits_only_outside_filter_entry() {
     let mut state = InputState::default();
     let mut config = config(None, false, false, false);
     let mut output = Vec::new();
     assert_eq!(
         state
-            .handle_utf16('/' as u16, &mut config, &mut output)
+            .handle_key(key(KeyCode::Char('q')), &mut config, &mut output)
+            .unwrap(),
+        InputAction::Quit
+    );
+    state
+        .handle_key(key(KeyCode::Char('/')), &mut config, &mut output)
+        .unwrap();
+    assert_eq!(
+        state
+            .handle_key(key(KeyCode::Char('q')), &mut config, &mut output)
             .unwrap(),
         InputAction::Continue
     );
-    for unit in "日本😀".encode_utf16() {
-        state.handle_utf16(unit, &mut config, &mut output).unwrap();
-    }
     state
-        .handle_utf16('\r' as u16, &mut config, &mut output)
+        .handle_key(key(KeyCode::Enter), &mut config, &mut output)
         .unwrap();
-    assert_eq!(config.filter_text(), Some("日本😀"));
+    assert_eq!(config.filter_text(), Some("q"));
+}
+
+#[test]
+fn control_c_always_quits() {
+    let mut state = InputState::default();
+    let mut config = config(None, false, false, false);
+    let mut output = Vec::new();
     state
-        .handle_utf16('/' as u16, &mut config, &mut output)
+        .handle_key(key(KeyCode::Char('/')), &mut config, &mut output)
         .unwrap();
-    for unit in "Error".encode_utf16() {
-        state.handle_utf16(unit, &mut config, &mut output).unwrap();
-    }
-    state
-        .handle_utf16('\r' as u16, &mut config, &mut output)
-        .unwrap();
-    assert!(config.line_matches("error"));
-    state
-        .handle_utf16('c' as u16, &mut config, &mut output)
-        .unwrap();
-    assert!(config.case_sensitive);
-    assert!(!config.line_matches("error"));
-    for command in ['?', 's', 'l', 'd'] {
-        state
-            .handle_utf16(command as u16, &mut config, &mut output)
-            .unwrap();
-    }
-    assert!(config.ignore_blank_lines && !config.colored_log_level && config.suppress_log_date);
-    state
-        .handle_utf16('r' as u16, &mut config, &mut output)
-        .unwrap();
-    assert_eq!(config.filter_text(), None);
-    assert_eq!(
-        state.handle_utf16(3, &mut config, &mut output).unwrap(),
-        InputAction::Quit
-    );
     assert_eq!(
         state
-            .handle_utf16('q' as u16, &mut config, &mut output)
+            .handle_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut config,
+                &mut output,
+            )
             .unwrap(),
         InputAction::Quit
     );
+}
+
+#[test]
+fn enter_installs_unicode_filter() {
+    let mut state = InputState::default();
+    let mut config = config(None, false, false, false);
+    let mut output = Vec::new();
+    for code in [
+        KeyCode::Char('/'),
+        KeyCode::Char('日'),
+        KeyCode::Char('本'),
+        KeyCode::Char('😀'),
+        KeyCode::Enter,
+    ] {
+        state
+            .handle_key(key(code), &mut config, &mut output)
+            .unwrap();
+    }
+    assert_eq!(config.filter_text(), Some("日本😀"));
     assert!(
         String::from_utf8(output)
             .unwrap()
@@ -139,46 +154,40 @@ fn console_input_filters_toggles_and_quits() {
 }
 
 #[test]
-fn zero_unicode_key_events_do_not_enter_the_filter() {
+fn interactive_commands_retain_their_effects() {
     let mut state = InputState::default();
-    let mut config = config(None, false, false, false);
+    let mut config = config(Some("Error"), false, false, false);
     let mut output = Vec::new();
-    for unit in ['/' as u16, 0, 'x' as u16, '\r' as u16] {
-        state.handle_utf16(unit, &mut config, &mut output).unwrap();
-    }
-    assert_eq!(config.filter_text(), Some("x"));
-}
-
-#[test]
-fn control_c_quits_while_q_remains_literal_in_a_filter() {
-    let mut state = InputState::default();
-    let mut config = config(None, false, false, false);
-    let mut output = Vec::new();
-    state
-        .handle_utf16('/' as u16, &mut config, &mut output)
-        .unwrap();
-    assert_eq!(
+    for command in ['?', 'c', 's', 'l', 'd', 'r'] {
         state
-            .handle_utf16('q' as u16, &mut config, &mut output)
-            .unwrap(),
-        InputAction::Continue
-    );
-    assert_eq!(state.text, "q");
-    assert_eq!(
-        state.handle_utf16(3, &mut config, &mut output).unwrap(),
-        InputAction::Quit
-    );
+            .handle_key(key(KeyCode::Char(command)), &mut config, &mut output)
+            .unwrap();
+    }
+    assert!(config.case_sensitive);
+    assert!(config.ignore_blank_lines);
+    assert!(!config.colored_log_level);
+    assert!(config.suppress_log_date);
+    assert_eq!(config.filter_text(), None);
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("> Commands:"));
+    assert!(output.contains("suppress log date"));
 }
 
 #[test]
-fn interactive_help_spells_suppress_correctly() {
+fn non_character_keys_do_nothing() {
+    let mut state = InputState::default();
+    let mut config = config(Some("keep"), false, false, false);
     let mut output = Vec::new();
-    write_help(&mut output).unwrap();
-    assert!(
-        String::from_utf8(output)
-            .unwrap()
-            .contains("suppress log date")
-    );
+    for code in [KeyCode::Backspace, KeyCode::Left, KeyCode::F(1)] {
+        assert_eq!(
+            state
+                .handle_key(key(code), &mut config, &mut output)
+                .unwrap(),
+            InputAction::Continue
+        );
+    }
+    assert_eq!(config.filter_text(), Some("keep"));
+    assert!(output.is_empty());
 }
 
 #[test]
@@ -254,6 +263,7 @@ fn filters_dates_levels_blanks_and_formats_without_color() {
 
 #[test]
 fn cycles_through_the_legacy_file_colors() {
+    crossterm::style::Colored::set_ansi_color_disabled(false);
     let mut output = Vec::new();
     for index in 0..7 {
         write_line(
@@ -267,8 +277,22 @@ fn cycles_through_the_legacy_file_colors() {
         .unwrap();
     }
     let output = String::from_utf8(output).unwrap();
-    let colors = output.lines().map(|line| &line[2..4]).collect::<Vec<_>>();
-    assert_eq!(colors, ["32", "34", "35", "36", "37", "90", "32"]);
+    let colors = output
+        .lines()
+        .map(|line| line.split_once('m').unwrap().0)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        colors,
+        [
+            "\x1b[38;5;2",
+            "\x1b[38;5;4",
+            "\x1b[38;5;5",
+            "\x1b[38;5;6",
+            "\x1b[38;5;7",
+            "\x1b[38;5;8",
+            "\x1b[38;5;2",
+        ]
+    );
 }
 
 #[test]

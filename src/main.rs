@@ -1,247 +1,33 @@
 use clap::Parser;
 use cli::{Cli, Config};
+use crossterm::QueueableCommand;
+use crossterm::style::{Color, Colored, ResetColor, SetForegroundColor};
+use events::{AppEvent, Events};
+use input::{InputAction, InputState};
 use log_entry::{LogEntry, formatted_timestamp, scan_group};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0};
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-    FindCloseChangeNotification, FindFirstChangeNotificationW, FindNextChangeNotification,
-};
-use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetNumberOfConsoleInputEvents,
-    GetStdHandle, INPUT_RECORD, KEY_EVENT, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleMode,
-};
-use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
 mod cli;
+mod events;
+mod input;
 mod log_entry;
 
 const READ_BUFFER_SIZE: usize = 16 * 1024;
 const RETAINED_PENDING_BUFFER_SIZE: usize = 4 * 1024;
 const LOG_DATE_PREFIX_LEN: usize = 20;
 const SEPARATOR_WIDTH: usize = 79;
-const LEGACY_FILE_COLORS: [usize; 6] = [32, 34, 35, 36, 37, 90];
-
-#[derive(Debug, PartialEq)]
-enum InputAction {
-    Continue,
-    Quit,
-}
-
-#[derive(Default)]
-struct InputState {
-    entering_filter: bool,
-    text: String,
-    high_surrogate: Option<u16>,
-}
-
-impl InputState {
-    fn handle_utf16<W: Write>(
-        &mut self,
-        unit: u16,
-        config: &mut Config,
-        out: &mut W,
-    ) -> io::Result<InputAction> {
-        if unit == 0 {
-            Ok(InputAction::Continue)
-        } else if let Some(high) = self.high_surrogate.take() {
-            let mut action = InputAction::Continue;
-            for decoded in char::decode_utf16([high, unit]) {
-                action =
-                    self.handle_char(decoded.unwrap_or(char::REPLACEMENT_CHARACTER), config, out)?;
-            }
-            Ok(action)
-        } else if (0xD800..=0xDBFF).contains(&unit) {
-            self.high_surrogate = Some(unit);
-            Ok(InputAction::Continue)
-        } else {
-            self.handle_char(
-                char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER),
-                config,
-                out,
-            )
-        }
-    }
-
-    fn handle_char<W: Write>(
-        &mut self,
-        character: char,
-        config: &mut Config,
-        out: &mut W,
-    ) -> io::Result<InputAction> {
-        if character == '\u{3}' {
-            return Ok(InputAction::Quit);
-        }
-        if self.entering_filter {
-            if matches!(character, '\r' | '\n') {
-                self.entering_filter = false;
-                config.set_filter(Some(std::mem::take(&mut self.text)));
-                writeln!(
-                    out,
-                    "\n> filter = {}",
-                    config.filter_text().unwrap_or_default()
-                )?;
-            } else {
-                self.text.push(character);
-                write!(out, "{character}")?;
-            }
-            return Ok(InputAction::Continue);
-        }
-        match character {
-            'q' => Ok(InputAction::Quit),
-            '?' => write_help(out).map(|()| InputAction::Continue),
-            '\r' | '\n' => writeln!(out).map(|()| InputAction::Continue),
-            'c' => {
-                config.case_sensitive = !config.case_sensitive;
-                writeln!(out, "> caseSensitive = {}", config.case_sensitive)?;
-                Ok(InputAction::Continue)
-            }
-            's' => {
-                config.ignore_blank_lines = !config.ignore_blank_lines;
-                writeln!(out, "> ignoreBlankLines = {}", config.ignore_blank_lines)?;
-                Ok(InputAction::Continue)
-            }
-            'l' => {
-                config.colored_log_level = !config.colored_log_level;
-                writeln!(out, "> coloredLogLevel = {}", config.colored_log_level)?;
-                Ok(InputAction::Continue)
-            }
-            'd' => {
-                config.suppress_log_date = !config.suppress_log_date;
-                writeln!(out, "> suppressLogDate = {}", config.suppress_log_date)?;
-                Ok(InputAction::Continue)
-            }
-            'r' => {
-                config.set_filter(None);
-                writeln!(out, "> filter cleared!")?;
-                Ok(InputAction::Continue)
-            }
-            '/' => {
-                self.entering_filter = true;
-                self.text.clear();
-                write!(out, "/")?;
-                Ok(InputAction::Continue)
-            }
-            _ => Ok(InputAction::Continue),
-        }
-    }
-}
-
-fn write_help<W: Write>(out: &mut W) -> io::Result<()> {
-    writeln!(out, "> Commands:")?;
-    writeln!(out, ">   ? - show this help")?;
-    writeln!(out, ">   q - quit")?;
-    writeln!(out, ">   c - toggle case sensitive")?;
-    writeln!(out, ">   s - toggle ignore blank lines")?;
-    writeln!(out, ">   l - toggle colored log level")?;
-    writeln!(out, ">   d - toggle suppress log date")?;
-    writeln!(out, ">   /<str> - filter")?;
-    writeln!(out, ">   r - reset filter")
-}
-
-struct ChangeNotification(HANDLE);
-
-impl ChangeNotification {
-    fn new(dir: &Path) -> io::Result<Self> {
-        let path = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let handle = unsafe {
-            FindFirstChangeNotificationW(
-                path.as_ptr(),
-                0,
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_SIZE
-                    | FILE_NOTIFY_CHANGE_LAST_WRITE,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(Self(handle))
-        }
-    }
-
-    fn rearm(&self) -> io::Result<()> {
-        if unsafe { FindNextChangeNotification(self.0) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl Drop for ChangeNotification {
-    fn drop(&mut self) {
-        // Change-notification handles have their own close API.
-        unsafe { FindCloseChangeNotification(self.0) };
-    }
-}
-
-struct ConsoleModes {
-    input: Option<(HANDLE, CONSOLE_MODE)>,
-    output: Option<(HANDLE, CONSOLE_MODE)>,
-    input_changed: bool,
-    output_changed: bool,
-}
-
-impl ConsoleModes {
-    fn new(input: HANDLE, output: HANDLE) -> io::Result<Self> {
-        let (input, input_changed) = set_console_mode(input, |mode| {
-            mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT)
-        })?;
-        let mut modes = Self {
-            input,
-            output: None,
-            input_changed,
-            output_changed: false,
-        };
-        let (output, output_changed) =
-            set_console_mode(output, |mode| mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
-        modes.output = output;
-        modes.output_changed = output_changed;
-        Ok(modes)
-    }
-}
-
-fn set_console_mode(
-    handle: HANDLE,
-    change: impl FnOnce(CONSOLE_MODE) -> CONSOLE_MODE,
-) -> io::Result<(Option<(HANDLE, CONSOLE_MODE)>, bool)> {
-    let mut mode = 0;
-    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-        return Ok((None, false));
-    }
-    let changed = change(mode);
-    if unsafe { SetConsoleMode(handle, changed) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((Some((handle, mode)), changed != mode))
-}
-
-impl Drop for ConsoleModes {
-    fn drop(&mut self) {
-        if self.input_changed
-            && let Some((handle, mode)) = self.input
-        {
-            unsafe { SetConsoleMode(handle, mode) };
-        }
-        if self.output_changed
-            && let Some((handle, mode)) = self.output
-        {
-            unsafe { SetConsoleMode(handle, mode) };
-        }
-    }
-}
+const FILE_COLORS: [Color; 6] = [
+    Color::DarkGreen,
+    Color::DarkBlue,
+    Color::DarkMagenta,
+    Color::DarkCyan,
+    Color::Grey,
+    Color::DarkGrey,
+];
 
 fn vrchat_log_dir() -> io::Result<PathBuf> {
     env::var_os("LOCALAPPDATA")
@@ -260,7 +46,7 @@ fn vrchat_log_dir_from_local_app_data(path: &Path) -> io::Result<PathBuf> {
 }
 
 fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
-    let notification = ChangeNotification::new(dir)?;
+    let events = Events::new(dir)?;
     let group = scan_group(dir, config.group_period_secs)?;
     if group.is_empty() && !config.watch_new_files {
         return Err(io::Error::new(
@@ -269,15 +55,7 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
         ));
     }
     let mut fixed_group = (!config.watch_new_files).then(|| group.clone());
-    let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let console_output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    let modes = ConsoleModes::new(stdin, console_output)?;
-    let console_input = modes.input.map(|(handle, _)| handle);
-    let mut handles = vec![notification.0];
-    if let Some(handle) = console_input {
-        handles.push(handle);
-    }
-    let color_output = modes.output.is_some() && io::stdout().is_terminal();
+    let color_output = io::stdout().is_terminal() && !Colored::ansi_color_disabled();
     let stdout = io::stdout();
     let mut output = stdout.lock();
     let mut tails = TailSet::open_initial(group, &mut output)?;
@@ -285,61 +63,19 @@ fn run_in_dir(mut config: Config, dir: &Path) -> io::Result<()> {
 
     loop {
         output.flush()?;
-        let result =
-            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
-        if result == WAIT_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        if result == WAIT_OBJECT_0 {
-            notification.rearm()?;
-            if config.watch_new_files {
-                tails.reconcile(scan_group(dir, config.group_period_secs)?, &mut output)?;
-            } else if let Some(group) = fixed_group.as_mut() {
-                tails.reconcile_fixed(group, &mut output)?;
-            }
-            tails.drain(&config, color_output, &mut output)?;
-            continue;
-        }
-        if result == WAIT_OBJECT_0 + 1 {
-            let Some(handle) = console_input else {
-                continue;
-            };
-            let mut count = 0;
-            if unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut records = [INPUT_RECORD::default(); 32];
-            while count != 0 {
-                let mut read = 0;
-                if unsafe {
-                    ReadConsoleInputW(
-                        handle,
-                        records.as_mut_ptr(),
-                        records.len() as u32,
-                        &mut read,
-                    )
-                } == 0
-                {
-                    return Err(io::Error::last_os_error());
+        match events.recv()? {
+            AppEvent::FilesChanged => {
+                events.clear_file_event();
+                if config.watch_new_files {
+                    tails.reconcile(scan_group(dir, config.group_period_secs)?, &mut output)?;
+                } else if let Some(group) = fixed_group.as_mut() {
+                    tails.reconcile_fixed(group, &mut output)?;
                 }
-                for record in &records[..read as usize] {
-                    if record.EventType != KEY_EVENT as u16 {
-                        continue;
-                    }
-                    let key = unsafe { record.Event.KeyEvent };
-                    if key.bKeyDown == 0 {
-                        continue;
-                    }
-                    let unit = unsafe { key.uChar.UnicodeChar };
-                    for _ in 0..key.wRepeatCount {
-                        if input.handle_utf16(unit, &mut config, &mut output)? == InputAction::Quit
-                        {
-                            return Ok(());
-                        }
-                    }
-                }
-                if unsafe { GetNumberOfConsoleInputEvents(handle, &mut count) } == 0 {
-                    return Err(io::Error::last_os_error());
+                tails.drain(&config, color_output, &mut output)?;
+            }
+            AppEvent::Key(key) => {
+                if input.handle_key(key, &mut config, &mut output)? == InputAction::Quit {
+                    return Ok(());
                 }
             }
         }
@@ -664,38 +400,48 @@ fn write_line<W: Write>(
     }
     let prefix = format!("{timestamp} [{index}] ");
     if color_output {
-        let index_code = LEGACY_FILE_COLORS[index % LEGACY_FILE_COLORS.len()];
+        let index_color = FILE_COLORS[index % FILE_COLORS.len()];
+        out.queue(SetForegroundColor(index_color))?;
+        write!(out, "{prefix}")?;
         if config.colored_log_level
             && let Some((level, suffix)) = log_level(line)
         {
-            let level_code = if matches!(level, "Error" | "Exception") {
-                31
+            let level_color = if matches!(level, "Error" | "Exception") {
+                Color::DarkRed
             } else if level == "Warning" {
-                33
+                Color::DarkYellow
             } else {
-                34
+                Color::DarkBlue
             };
-            writeln!(
+            out.queue(ResetColor)?;
+            out.queue(SetForegroundColor(level_color))?;
+            write!(
                 out,
-                "\x1b[{index_code}m{prefix}\x1b[0m\x1b[{level_code}m{}\x1b[0m\x1b[{index_code}m{}\x1b[0m",
+                "{}",
                 if config.suppress_log_date {
                     level
                 } else {
                     &line[..LOG_DATE_PREFIX_LEN + level.len()]
-                },
-                suffix
+                }
             )?;
+            out.queue(ResetColor)?;
+            out.queue(SetForegroundColor(index_color))?;
+            write!(out, "{suffix}")?;
+            out.queue(ResetColor)?;
+            writeln!(out)?;
             return Ok(());
         }
-        writeln!(
+        write!(
             out,
-            "\x1b[{index_code}m{prefix}{}\x1b[0m",
+            "{}",
             if config.suppress_log_date {
                 strip_log_date(line)
             } else {
                 line
             }
-        )
+        )?;
+        out.queue(ResetColor)?;
+        writeln!(out)
     } else {
         writeln!(
             out,
