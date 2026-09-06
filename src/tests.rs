@@ -152,7 +152,7 @@ fn parses_cli_flags_and_defaults() {
     let CliAction::Run(defaults) = parse_args(["vrc-tail"]).unwrap() else {
         panic!();
     };
-    assert_eq!(defaults.group_period_secs, DEFAULT_GROUP_PERIOD_SECS);
+    assert_eq!(defaults.group_period_secs, 30);
     assert!(defaults.watch_new_files);
     assert!(defaults.colored_log_level);
 

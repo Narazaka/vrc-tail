@@ -148,8 +148,7 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let mut args = args.into_iter().map(Into::into);
-    args.next();
+    let mut args = args.into_iter().map(Into::into).skip(1);
     let mut config = Config {
         filter: None,
         normalized_filter: None,
@@ -821,8 +820,11 @@ fn line_matches(line: &str, config: &Config) -> bool {
     if config.case_sensitive {
         line.contains(filter)
     } else {
-        let filter = config.normalized_filter.as_deref().unwrap_or_default();
-        filter.is_empty() || line.to_lowercase().contains(filter)
+        let normalized_filter = config
+            .normalized_filter
+            .as_deref()
+            .expect("normalized filter must accompany a filter");
+        normalized_filter.is_empty() || line.to_lowercase().contains(normalized_filter)
     }
 }
 
@@ -851,8 +853,8 @@ fn has_log_date_prefix(line: &str) -> bool {
         && line.as_bytes()[10] == b' '
         && line.as_bytes()[13] == b':'
         && line.as_bytes()[16] == b':'
-        && line.as_bytes()[19] == b' '
-        && line.as_bytes()[..19]
+        && line.as_bytes()[LOG_DATE_PREFIX_LEN - 1] == b' '
+        && line.as_bytes()[..LOG_DATE_PREFIX_LEN - 1]
             .iter()
             .enumerate()
             .all(|(i, byte)| matches!(i, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
